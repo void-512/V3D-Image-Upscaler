@@ -1,0 +1,63 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(set=0,binding=0,std430) readonly buffer Input {float a[];};
+layout(set=0,binding=2,std430) buffer Output {float o[];};
+layout(set=0,binding=3,std430) readonly buffer Weight {float w[];};
+layout(set=0,binding=4,std430) readonly buffer Residual {float d[];};
+layout(set=0,binding=6,std430) readonly buffer Input4 {vec4 a4[];};
+layout(set=0,binding=7,std430) readonly buffer Weight4 {vec4 w4[];};
+layout(push_constant,std430) uniform Params {int p[24];};
+layout(local_size_x=16,local_size_y=12) in;
+layout(constant_id=0) const int H=16;
+layout(constant_id=1) const int W=16;
+layout(constant_id=2) const int IC=64;
+layout(constant_id=3) const int OC=32;
+layout(constant_id=4) const int UP=1;
+layout(constant_id=7) const int MODE=0;
+layout(constant_id=8) const int STRIDE=64;
+layout(constant_id=9) const int OSTRIDE=32;
+layout(constant_id=10) const int OFFSET=0;
+layout(constant_id=11) const int ADD=0;
+float input_at(int row,int k){
+    int y=row/W+p[16]+k/IC/3-1,x=row%W+(k/IC)%3-1;
+    return (row<p[17]*W&&y>=0&&y<H&&x>=0&&x<W)?a[((y/UP-p[18])*(W/UP)+x/UP)*STRIDE+k%IC]:0.;
+}
+void main(){
+    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
+    int row=(int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y))*16;
+    int col=int(gl_WorkGroupID.x)*16;
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+    for(int k=0;k<IC*9;k+=4){
+        int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+        vec4 av;
+        if(IC%4==0){
+            int r=row+lane,y=r/W+p[16]+k/IC/3-1,x=r%W+(k/IC)%3-1;
+            av=(r<p[17]*W&&y>=0&&y<H&&x>=0&&x<W)?a4[(((y/UP-p[18])*(W/UP)+x/UP)*STRIDE+k%IC)/4]:vec4(0);
+        }else
+        av=vec4(input_at(rr,kk),input_at(rr+1,kk),input_at(rr+2,kk),input_at(rr+3,kk));
+        vec4 bv=vec4(0);
+        if(kk<IC*9){
+            if(OC%4==0)bv=cc<OC?w4[(p[5]+kk*OC+cc)/4]:vec4(0);
+            else for(int j=0;j<4;j++)if(cc+j<OC)bv[j]=w[p[5]+kk*OC+cc+j];
+        }
+        for(int j=0;j<4;j++){
+            vec4 aa;
+            if(IC%4==0)aa=vec4(subgroupShuffle(av[j],mi*4),subgroupShuffle(av[j],mi*4+1),subgroupShuffle(av[j],mi*4+2),subgroupShuffle(av[j],mi*4+3));
+            else
+            aa=subgroupShuffle(av,mi*4+j);
+            vec4 bb=subgroupShuffle(bv,ni*4+j);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+    }
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++){
+        int r=row+mi*4+i,c=col+ni*4+j;
+        if(r<p[17]*W&&c<OC){
+            float v=(i==0?s0[j]:i==1?s1[j]:i==2?s2[j]:s3[j])+w[p[6]+c];
+            if(MODE==1)v=max(v,0.)+0.2*min(v,0.);
+            if(MODE==2)v=0.2*v;
+            if(ADD!=0)v+=d[r*(MODE==2?192:64)+c];
+            o[(r+p[19]*W)*OSTRIDE+OFFSET+c]=v;
+        }
+    }
+}

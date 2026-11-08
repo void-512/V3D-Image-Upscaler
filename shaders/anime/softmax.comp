@@ -1,0 +1,18 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "common.glsl"
+layout(local_size_x=16,local_size_y=12) in;
+void main(){
+    int row=int(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*12+int(gl_LocalInvocationID.y);
+    if(row>=p[11]*384)return;
+    int lane=int(gl_SubgroupInvocationID);
+    // There are exactly 384 rows per window, divisible by twelve.
+    float v[8],mx=-3.402823e38;
+    for(int i=0;i<8;i++){v[i]=a[row*128+i*16+lane];mx=max(mx,v[i]);}
+    mx=subgroupMax(mx);float z=0.0;
+    for(int i=0;i<8;i++){v[i]=exp(v[i]-mx);z+=v[i];}
+    z=subgroupAdd(z);
+    for(int i=0;i<8;i++)o[row*128+i*16+lane]=v[i]/z;
+}

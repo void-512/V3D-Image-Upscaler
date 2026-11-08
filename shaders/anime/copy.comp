@@ -1,0 +1,9 @@
+#version 450
+layout(local_size_x=192) in;
+layout(set=0,binding=0,std430) readonly buffer Input { vec4 a[]; };
+layout(set=0,binding=2,std430) buffer Output { vec4 o[]; };
+layout(push_constant,std430) uniform Params { int p[24]; };
+void main() {
+    uint i=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationID.x;
+    if(i<uint(p[0]))o[i]=a[i];
+}

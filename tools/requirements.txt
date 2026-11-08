@@ -1,0 +1,3 @@
+numpy
+einops
+# Install an ARM64 CPU build of PyTorch separately if the environment lacks it.

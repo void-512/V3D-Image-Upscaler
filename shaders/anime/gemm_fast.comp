@@ -1,0 +1,86 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common.glsl"
+layout(set=0,binding=2,std430) buffer PackedOutput { vec4 o4[]; };
+layout(set=0,binding=4,std430) readonly buffer PackedResidual { vec4 d4[]; };
+layout(set=0,binding=6,std430) readonly buffer PackedInput { vec4 a4[]; };
+layout(set=0,binding=7,std430) readonly buffer PackedWeights { vec4 w4[]; };
+// Twelve independent subgroups match the Pi 5's twelve QPUs. Each subgroup
+// computes a 16x16 tile entirely in registers, reusing operands via shuffle.
+layout(local_size_x=16,local_size_y=12) in;
+layout(constant_id=0) const int H=16;
+layout(constant_id=1) const int W=16;
+layout(constant_id=2) const int IC=180;
+layout(constant_id=3) const int OC=180;
+layout(constant_id=4) const int KS=1;
+// ACT: 0 identity, 1 GELU, 2 sigmoid for reusable attention gates.
+layout(constant_id=7) const int ACT=0;
+layout(constant_id=8) const int STRIDE=180;
+layout(constant_id=9) const int OFFSET=0;
+layout(constant_id=10) const int ADD=0;
+layout(constant_id=11) const int PACKED=0;
+float input_at(int row,int k) {
+    if(row>=H*W||k>=IC*KS*KS)return 0.0;
+    if(KS==1)return a[row*STRIDE+OFFSET+k];
+    int y=row/W+k/IC/KS-KS/2,x=row%W+(k/IC)%KS-KS/2;
+    return (y>=0&&y<H&&x>=0&&x<W)?a[(y*W+x)*STRIDE+OFFSET+k%IC]:0.0;
+}
+float weight_at(int k,int col){
+    if(k>=IC*KS*KS||col>=OC)return 0.0;
+    int idx=p[5]+k*OC+col;
+    return w[idx];
+}
+void store_row(int r,int c,vec4 value){
+    if(r>=H*W||c>=OC)return;
+    value+=w4[(p[6]+c)/4];
+    if(ACT==1)value=vec4(gelu(value.x),gelu(value.y),gelu(value.z),gelu(value.w));
+    if(ACT==2)value=vec4(sigmoid(value.x),sigmoid(value.y),sigmoid(value.z),sigmoid(value.w));
+    if(ADD!=0)value+=d4[(r*OC+c)/4];
+    o4[(r*OC+c)/4]=value;
+}
+void main(){
+    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
+    int row=(int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y))*16;
+    int col=int(gl_WorkGroupID.x)*16;
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+    for(int k=0;k<IC*KS*KS;k+=4){
+        int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+        vec4 av;
+        if(PACKED!=0)av=(rr<H*W&&kk<IC)?a4[(rr/4)*IC+kk]:vec4(0);
+        else av=vec4(input_at(rr,kk),input_at(rr+1,kk),input_at(rr+2,kk),input_at(rr+3,kk));
+        vec4 bv;
+        if(OC%4==0)bv=(kk<IC*KS*KS&&cc<OC)?w4[(p[5]+kk*OC+cc)/4]:vec4(0);
+        else
+        bv=vec4(weight_at(kk,cc),weight_at(kk,cc+1),weight_at(kk,cc+2),weight_at(kk,cc+3));
+        // Accumulate channels in order with fixed shuffle indices.
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+0),bb=subgroupShuffle(bv,ni*4+0);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+1),bb=subgroupShuffle(bv,ni*4+1);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+2),bb=subgroupShuffle(bv,ni*4+2);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+3),bb=subgroupShuffle(bv,ni*4+3);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+    }
+    if(OC%4==0){
+        int r=row+mi*4,c=col+ni*4;
+        store_row(r,c,s0);store_row(r+1,c,s1);store_row(r+2,c,s2);store_row(r+3,c,s3);
+    }else
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++){
+        int r=row+mi*4+i,c=col+ni*4+j;
+        if(r<H*W&&c<OC){
+            float v=(i==0?s0[j]:i==1?s1[j]:i==2?s2[j]:s3[j])+w[p[6]+c];
+            if(ACT==1)v=gelu(v);if(ACT==2)v=sigmoid(v);if(ADD!=0)v+=d[r*OC+c];o[r*OC+c]=v;
+        }
+    }
+}

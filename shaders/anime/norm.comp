@@ -1,0 +1,19 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "common.glsl"
+layout(local_size_x=16,local_size_y=12) in;
+void main(){
+    int row=int(gl_WorkGroupID.x)*12+int(gl_LocalInvocationID.y);
+    if(row<p[0]){
+        int lane=int(gl_SubgroupInvocationID);
+        float sum=0.0;
+        for(int c=lane;c<180;c+=16)sum+=a[row*p[2]+p[3]+c];
+        float mean=subgroupAdd(sum)/180.0;
+        float variance=0.0;
+        for(int c=lane;c<180;c+=16){float v=a[row*p[2]+p[3]+c]-mean;variance+=v*v;}
+        float inv=inversesqrt(subgroupAdd(variance)/180.0+1e-5);
+        for(int c=lane;c<180;c+=16){int dst=p[6]!=0?((row/4)*180+c)*4+row%4:row*180+c;o[dst]=(a[row*p[2]+p[3]+c]-mean)*inv*w[p[4]+c]+w[p[5]+c];}
+    }
+}

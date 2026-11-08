@@ -1,0 +1,7 @@
+/build*/
+/upscaler
+/.venv/
+/.codegraph/
+__pycache__/
+*.pyc
+/outputs/

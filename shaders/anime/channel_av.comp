@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common.glsl"
+layout(local_size_x=16,local_size_y=12) in;
+float value(int n,int c,int head){return n<p[0]&&c<30?b[n*540+360+head*30+c]:0.0;}
+float coeff(int k,int c,int head){return k<30&&c<30?a[head*900+c*30+k]:0.0;}
+void main(){
+    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
+    int row=(int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y))*16,col=int(gl_WorkGroupID.x)*16,head=int(gl_WorkGroupID.z);
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+    for(int k=0;k<32;k+=4){
+        int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+        vec4 av=vec4(value(rr,kk,head),value(rr+1,kk,head),value(rr+2,kk,head),value(rr+3,kk,head));
+        vec4 bv=vec4(coeff(kk,cc,head),coeff(kk,cc+1,head),coeff(kk,cc+2,head),coeff(kk,cc+3,head));
+        for(int j=0;j<4;j++){
+            vec4 aa=subgroupShuffle(av,mi*4+j),bb=subgroupShuffle(bv,ni*4+j);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+    }
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++){
+        int r=row+mi*4+i,c=col+ni*4+j;
+        if(r<p[0]&&c<30)o[r*180+head*30+c]=i==0?s0[j]:i==1?s1[j]:i==2?s2[j]:s3[j];
+    }
+}

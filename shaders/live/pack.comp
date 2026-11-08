@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x=192) in;
+layout(set=0,binding=0,std430) readonly buffer Input {float a[];};
+layout(set=0,binding=2,std430) buffer Output {float o[];};
+layout(set=0,binding=4,std430) readonly buffer Residual {float d[];};
+layout(push_constant,std430) uniform Params {int p[24];};
+void main(){
+    int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationID.x);
+    if(i>=p[0]*64)return;
+    int r=i/64,c=i%64;
+    if(p[1]==1)o[i]=a[r*192+c];
+    else o[r*192+c]=p[1]==2?0.2*a[i]+d[i]:a[i];
+}

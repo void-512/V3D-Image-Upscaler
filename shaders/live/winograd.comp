@@ -1,0 +1,138 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x=16,local_size_y=12) in;
+layout(set=0,binding=0,std430) readonly buffer Input {float a[];};
+#if OP == 1
+layout(set=0,binding=2,std430) buffer Output {vec4 o4[];};
+#else
+layout(set=0,binding=2,std430) buffer Output {float o[];};
+#endif
+layout(set=0,binding=3,std430) readonly buffer Weights {float w[];};
+layout(set=0,binding=4,std430) readonly buffer Residual {float d[];};
+layout(set=0,binding=5,std430) readonly buffer OuterResidual {float e[];};
+layout(set=0,binding=6,std430) readonly buffer Input4 {vec4 a4[];};
+layout(set=0,binding=7,std430) readonly buffer Weight4 {vec4 w4[];};
+layout(push_constant,std430) uniform Params {int p[24];};
+layout(constant_id=0) const int H=16;
+layout(constant_id=1) const int W=16;
+layout(constant_id=2) const int IC=64;
+layout(constant_id=3) const int OC=32;
+layout(constant_id=7) const int MODE=0;
+layout(constant_id=8) const int STRIDE=64;
+layout(constant_id=9) const int OSTRIDE=32;
+layout(constant_id=10) const int OFFSET=0;
+layout(constant_id=11) const int ADD=0;
+layout(constant_id=12) const int T=64;
+layout(constant_id=13) const int TW=8;
+layout(constant_id=14) const int FIRST=0;
+layout(constant_id=15) const int COUNT=64;
+
+#ifdef ANIME
+#define WINSTRIDE IC
+#else
+#define WINSTRIDE 192
+#endif
+
+void main(){
+#if OP == 0
+    int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
+    if(i>=T*COUNT)return;
+    int tile=i/COUNT,c=FIRST+i%COUNT;
+#ifdef ANIME
+    int imageTile=tile+p[16];
+#else
+    int imageTile=tile;
+#endif
+    int yy=imageTile/TW*4-1,xx=imageTile%TW*4-1;
+    float v[36];
+    for(int y=0;y<6;y++) {
+        float r[6];
+        for(int x=0;x<6;x++)r[x]=(yy+y>=0&&yy+y<H&&xx+x>=0&&xx+x<W)?a[((yy+y)*W+xx+x)*STRIDE+c]:0.;
+        v[y*6+0]=4.*r[0]-5.*r[2]+r[4];
+        v[y*6+1]=-4.*r[1]-4.*r[2]+r[3]+r[4];
+        v[y*6+2]=4.*r[1]-4.*r[2]-r[3]+r[4];
+        v[y*6+3]=-2.*r[1]-r[2]+2.*r[3]+r[4];
+        v[y*6+4]=2.*r[1]-r[2]-2.*r[3]+r[4];
+        v[y*6+5]=4.*r[1]-5.*r[3]+r[5];
+    }
+    for(int x=0;x<6;x++) {
+        float r[6],q[6];
+        for(int y=0;y<6;y++)r[y]=v[y*6+x];
+        q[0]=4.*r[0]-5.*r[2]+r[4];
+        q[1]=-4.*r[1]-4.*r[2]+r[3]+r[4];
+        q[2]=4.*r[1]-4.*r[2]-r[3]+r[4];
+        q[3]=-2.*r[1]-r[2]+2.*r[3]+r[4];
+        q[4]=2.*r[1]-r[2]-2.*r[3]+r[4];
+        q[5]=4.*r[1]-5.*r[3]+r[5];
+        for(int y=0;y<6;y++)o[(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4]=q[y];
+    }
+#elif OP == 1
+    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
+    // Flatten transform planes and tile rows so small images do not waste
+    // most of a 12-subgroup workgroup on out-of-range tiles in every plane.
+    int subgroup=int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y);
+    int row=(subgroup%((T+15)/16))*16,col=int(gl_WorkGroupID.x)*16,plane=subgroup/((T+15)/16);
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+    for(int k=0;k<IC;k+=4) {
+        int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+        vec4 av=rr<T?a4[(plane*T/4+rr/4)*WINSTRIDE+kk]:vec4(0);
+        vec4 bv=cc<OC?w4[(p[5]+(plane*IC+kk)*OC+cc)/4]:vec4(0);
+        // Accumulate four input channels with fixed shuffle indices.
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+0),bb=subgroupShuffle(bv,ni*4+0);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+1),bb=subgroupShuffle(bv,ni*4+1);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+2),bb=subgroupShuffle(bv,ni*4+2);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+        {
+            vec4 aa=subgroupShuffle(av,mi*4+3),bb=subgroupShuffle(bv,ni*4+3);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+    }
+    int r=row+mi*4,c=col+ni*4;
+    if(c<OC){
+        if(r<T)o4[((plane*T+r)*OC+c)/4]=s0;
+        if(r+1<T)o4[((plane*T+r+1)*OC+c)/4]=s1;
+        if(r+2<T)o4[((plane*T+r+2)*OC+c)/4]=s2;
+        if(r+3<T)o4[((plane*T+r+3)*OC+c)/4]=s3;
+    }
+#else
+    int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
+    #ifdef ANIME
+    int tiles=p[17];
+#else
+    int tiles=((H+3)/4)*TW;
+#endif
+    if(i>=tiles*OC)return;
+    int tile=i/OC,c=i%OC;
+#ifdef ANIME
+    int imageTile=tile+p[16];
+#else
+    int imageTile=tile;
+#endif
+    int yy=imageTile/TW*4,xx=imageTile%TW*4;
+    vec4 r[6];
+    for(int y=0;y<6;y++) {
+        float v[6];
+        for(int x=0;x<6;x++)v[x]=a[((y*6+x)*T+tile)*OC+c];
+        r[y]=vec4(v[0]+v[1]+v[2]+v[3]+v[4],v[1]-v[2]+2.*(v[3]-v[4]),v[1]+v[2]+4.*(v[3]+v[4]),v[1]-v[2]+8.*(v[3]-v[4])+v[5]);
+    }
+    vec4 result[4]=vec4[4](r[0]+r[1]+r[2]+r[3]+r[4],r[1]-r[2]+2.*(r[3]-r[4]),r[1]+r[2]+4.*(r[3]+r[4]),r[1]-r[2]+8.*(r[3]-r[4])+r[5]);
+    for(int y=0;y<4;y++)for(int x=0;x<4;x++)if(yy+y<H&&xx+x<W){
+        int row=(yy+y)*W+xx+x;
+        float v=result[y][x]+w[p[6]+c];
+        if(MODE==1)v=max(v,0.)+0.2*min(v,0.);
+        if(MODE>=2)v*=0.2;
+        if(ADD!=0)v+=d[row*(MODE>=2?192:OSTRIDE)+c];
+        if(MODE==3)v=0.2*v+e[row*64+c];
+        o[row*OSTRIDE+OFFSET+c]=v;
+    }
+#endif
+}

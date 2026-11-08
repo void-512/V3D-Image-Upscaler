@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(set=0,binding=6,std430) readonly buffer In4 {vec4 a4[];};
+layout(set=0,binding=7,std430) readonly buffer Weights4 {vec4 w4[];};
+layout(set=0,binding=1,std430) readonly buffer Gate4 {vec4 b4[];};
+layout(set=0,binding=2,std430) buffer Out4 {vec4 o4[];};
+layout(local_size_x=192) in;
+layout(constant_id=0) const int H=16;
+layout(constant_id=1) const int W=16;
+layout(constant_id=3) const int STRIDE=180;
+layout(constant_id=4) const int OFFSET=0;
+layout(constant_id=7) const int ACT=0;
+layout(constant_id=8) const int GATE=0;
+layout(constant_id=9) const int PACKED=0;
+void main(){
+    int i=int(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+int(gl_LocalInvocationID.x);
+    if(i<H*W*45){
+        int c=(i%45)*4,pix=i/45,y=pix/W,x=pix%W;
+        vec4 v=w4[(p[6]+c)/4];
+        for(int ky=0;ky<3;ky++)for(int kx=0;kx<3;kx++){
+            int yy=y+ky-1,xx=x+kx-1;
+            if(yy>=0&&yy<H&&xx>=0&&xx<W)v+=a4[((yy*W+xx)*STRIDE+OFFSET+c)/4]*w4[(p[5]+(ky*3+kx)*180+c)/4];
+        }
+        if(ACT!=0)v=vec4(gelu(v.x),gelu(v.y),gelu(v.z),gelu(v.w));
+        if(GATE!=0)v*=b4[(pix*360+c)/4];
+        if(PACKED!=0){int dst=((pix/4)*180+c)*4+pix%4;o[dst]=v.x;o[dst+4]=v.y;o[dst+8]=v.z;o[dst+12]=v.w;}
+        else o4[i]=v;
+    }
+}

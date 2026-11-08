@@ -1,0 +1,32 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common.glsl"
+layout(local_size_x=16,local_size_y=12) in;
+layout(set=0,binding=6,std430) readonly buffer PackedInput { vec4 a4[]; };
+vec4 load_channels(int idx,int c,bool valid){
+    if(!valid)return vec4(0);
+    vec4 lo=a4[idx/4];
+    vec4 v=(idx%4==0)?lo:vec4(lo.zw,a4[idx/4+1].xy);
+    return v*vec4(lessThan(ivec4(c)+ivec4(0,1,2,3),ivec4(30)));
+}
+void main(){
+    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
+    int tile=int(gl_WorkGroupID.x)*12+int(gl_LocalInvocationID.y);
+    int head=tile/4,row=(tile%4)/2*16,col=(tile%2)*16,chunk=int(gl_WorkGroupID.y);
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+    for(int k=chunk*256;k<min((chunk+1)*256,p[0]);k+=4){
+        int n=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+        vec4 av=load_channels(n*540+head*30+rr,rr,n<p[0]);
+        vec4 bv=load_channels(n*540+180+head*30+cc,cc,n<p[0]);
+        for(int j=0;j<4;j++){
+            vec4 aa=subgroupShuffle(av,mi*4+j),bb=subgroupShuffle(bv,ni*4+j);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+    }
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++){
+        int r=row+mi*4+i,c=col+ni*4+j;
+        if(r<30&&c<30)o[chunk*5400+head*900+r*30+c]=i==0?s0[j]:i==1?s1[j]:i==2?s2[j]:s3[j];
+    }
+}

@@ -1,0 +1,76 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common.glsl"
+layout(set=0,binding=2,std430) buffer Out4 {vec4 o4[];};
+layout(set=0,binding=2,std430) buffer Out2 {vec2 o2[];};
+layout(set=0,binding=7,std430) readonly buffer Bias4 {vec4 w4[];};
+layout(local_size_x=16,local_size_y=12) in;
+layout(constant_id=0) const int H=16;
+layout(constant_id=1) const int W=16;
+layout(constant_id=2) const int PH=16;
+layout(constant_id=3) const int PW=16;
+layout(constant_id=4) const int WH=8;
+layout(constant_id=5) const int WW=16;
+layout(constant_id=6) const int SH=0;
+layout(constant_id=7) const int SW=0;
+layout(constant_id=8) const int CO=0;
+int pixel(int win,int tok){
+    win+=p[10];
+    int y=((win/(PW/WW))*WH+tok/WW+SH)%PH;
+    int x=((win%(PW/WW))*WW+tok%WW+SW)%PW;
+    return (y<H&&x<W)?y*W+x:-1;
+}
+int region(int win,int tok){
+    win+=p[10];
+    int y=(win/(PW/WW))*WH+tok/WW,x=(win%(PW/WW))*WW+tok%WW;
+    return (y<PH-WH?0:y<PH-SH?1:2)*3+(x<PW-WW?0:x<PW-SW?1:2);
+}
+float qkv(int pix,int c,int head,int kind){return pix>=0&&c<30?a[pix*540+kind*180+CO+head*30+c]:0.0;}
+void main(){
+    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
+    int tile=int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y),head=tile/8;
+    int row=(tile%8)*16,col=int(gl_WorkGroupID.x)*16,win=int(gl_WorkGroupID.z);
+    int base=(win*3+head)*16384;
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+#ifdef QK
+    int rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+    ivec4 rp=ivec4(pixel(win,rr),pixel(win,rr+1),pixel(win,rr+2),pixel(win,rr+3));
+    ivec4 cp=ivec4(pixel(win,cc),pixel(win,cc+1),pixel(win,cc+2),pixel(win,cc+3));
+    for(int k=0;k<32;k+=4){
+        int kk=k+lane%4;
+        vec4 av=vec4(qkv(rp.x,kk,head,0),qkv(rp.y,kk,head,0),qkv(rp.z,kk,head,0),qkv(rp.w,kk,head,0))*0.18257418583505536;
+        vec4 bv=vec4(qkv(cp.x,kk,head,1),qkv(cp.y,kk,head,1),qkv(cp.z,kk,head,1),qkv(cp.w,kk,head,1));
+#else
+    for(int k=0;k<128;k+=4){
+        int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
+        vec4 av=vec4(b[base+rr*128+kk],b[base+(rr+1)*128+kk],b[base+(rr+2)*128+kk],b[base+(rr+3)*128+kk]);
+        int pix=pixel(win,kk);
+        vec4 bv=vec4(qkv(pix,cc,head,2),qkv(pix,cc+1,head,2),qkv(pix,cc+2,head,2),qkv(pix,cc+3,head,2));
+#endif
+        for(int j=0;j<4;j++){
+            vec4 aa=subgroupShuffle(av,mi*4+j),bb=subgroupShuffle(bv,ni*4+j);
+            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
+        }
+    }
+    for(int i=0;i<4;i++){
+        int r=row+mi*4+i,c=col+ni*4;
+        vec4 v=i==0?s0:i==1?s1:i==2?s2:s3;
+#ifdef QK
+        v+=w4[(p[9]+head*16384+r*128+c)/4];
+        if(SH!=0){
+            int reg=region(win,r);
+            v-=100.0*vec4(notEqual(ivec4(reg),ivec4(region(win,c),region(win,c+1),region(win,c+2),region(win,c+3))));
+        }
+        o4[(base+r*128+c)/4]=v;
+#else
+        int pix=pixel(win,r);
+        if(pix>=0){
+            int dst=(pix*180+CO+head*30+c)/2;
+            if(c<30)o2[dst]=v.xy;
+            if(c+2<30)o2[dst+1]=v.zw;
+        }
+#endif
+    }
+}

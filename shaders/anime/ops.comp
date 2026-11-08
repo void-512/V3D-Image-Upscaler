@@ -1,0 +1,70 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=64) in;
+#if OP == 4
+layout(set=0,binding=2,std430) buffer PackedOut {vec4 o4[];};
+#endif
+void main() {
+    int lane=int(gl_LocalInvocationID.x);
+    int group=int(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x);
+    int i=group*64+lane;
+#if OP == 2
+    // Global mean, chunked in 256 pixels; avoids serial whole-image reductions.
+    int c=i%180, chunk=i/180;
+    if(chunk>=p[1])return;
+    float v=0.0;
+    for(int n=chunk*256;n<min((chunk+1)*256,p[0]);n++)v+=a[n*180+c];
+    o[i]=v;
+#elif OP == 3
+    if(i>=180)return;
+    float v=0.0;for(int j=0;j<p[1];j++)v+=a[j*180+i];
+    o[i]=v/float(p[0]);
+#elif OP == 4
+    // Four pixels per channel match the next linear layer's packed input.
+    int n=(i/180)*4,c=i%180;
+    if(n>=p[0])return;
+    vec4 av,bv,sg;
+    for(int j=0;j<4;j++){
+        bool valid=n+j<p[0];
+        av[j]=valid?a[(n+j)*180+c]:0.;
+        bv[j]=valid?b[(n+j)*180+c]:0.;
+        sg[j]=valid?e[n+j]:0.;
+    }
+    // Gate sigmoid is already computed once in the producing linear layer.
+    float cg=d[c];
+    o4[i]=p[1]==0?av*cg+bv*sg:av*sg+bv*cg;
+#elif OP == 6
+    // Q/K squared norms, partial sums. QKV is pixel-major, 540 channels.
+    int c=i%360,chunk=i/360;
+    if(chunk>=p[1])return;
+    float v=0.0;for(int n=chunk*256;n<min((chunk+1)*256,p[0]);n++){float x=a[n*540+c];v=fma(x,x,v);}
+    o[i]=v;
+#elif OP == 7
+    if(i>=360)return;
+    float v=0.0;for(int j=0;j<p[1];j++)v+=a[j*360+i];
+    o[i]=1.0/max(sqrt(v),1e-12);
+#elif OP == 8
+    // Channel-attention logits: reduce chunk products and apply Q/K norms.
+    if(i>=5400)return;
+    int head=i/900,q=(i%900)/30,k=i%30;
+    float v=0.0;for(int j=0;j<p[0];j++)v+=a[j*5400+i];
+    o[i]=v*b[head*30+q]*b[180+head*30+k]*w[p[1]+head];
+#elif OP == 9
+    // Softmax one 30-entry channel-attention row per lane.
+    if(i>=180)return;
+    float m=-3.402823e38;for(int j=0;j<30;j++)m=max(m,a[i*30+j]);
+    float z=0.0;for(int j=0;j<30;j++)z+=exp(a[i*30+j]-m);
+    for(int j=0;j<30;j++)o[i*30+j]=exp(a[i*30+j]-m)/z;
+#elif OP == 11
+    // Pixel shuffle, mean restoration; 1x/2x are box downsamples of the 4x output.
+    if(i>=p[0]*p[1]*p[2]*p[2]*3)return;
+    int c=i%3, pix=i/3, y=pix/(p[1]*p[2]),x=pix%(p[1]*p[2]);
+    int base=((y/p[2])*p[1]+x/p[2])*48+c*16;
+    float v;
+    if(p[2]==4)v=a[base+(y%4)*4+x%4];
+    else if(p[2]==2) {int off=(y%2)*8+(x%2)*2;v=0.25*(a[base+off]+a[base+off+1]+a[base+off+4]+a[base+off+5]);}
+    else { v=0.; for(int j=0;j<16;j++)v+=a[base+j]; v*=1./16.; }
+    o[i]=v+(c==0?0.4488:c==1?0.4371:0.4040);
+#endif
+}
