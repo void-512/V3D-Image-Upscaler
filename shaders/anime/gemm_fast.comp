@@ -48,10 +48,12 @@ void main(){
     for(int k=0;k<IC*KS*KS;k+=4){
         int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
         vec4 av;
-        if(PACKED!=0)av=(rr<H*W&&kk<IC)?a4[(rr/4)*IC+kk]:vec4(0);
+        if(PACKED!=0 && ACT==0 && IC%4==0)av=a4[(min(rr,((H*W-1)/4)*4)/4)*IC+kk];
+        else if(PACKED!=0)av=(rr<H*W&&kk<IC)?a4[(rr/4)*IC+kk]:vec4(0);
         else av=vec4(input_at(rr,kk),input_at(rr+1,kk),input_at(rr+2,kk),input_at(rr+3,kk));
         vec4 bv;
-        if(OC%4==0)bv=(kk<IC*KS*KS&&cc<OC)?w4[(p[5]+kk*OC+cc)/4]:vec4(0);
+        if(PACKED!=0 && ACT==0 && IC%4==0 && OC%4==0)bv=(kk<IC*KS*KS)?w4[(p[5]+kk*OC+min(cc,OC-4))/4]:vec4(0);
+        else if(OC%4==0)bv=(kk<IC*KS*KS&&cc<OC)?w4[(p[5]+kk*OC+cc)/4]:vec4(0);
         else
         bv=vec4(weight_at(kk,cc),weight_at(kk,cc+1),weight_at(kk,cc+2),weight_at(kk,cc+3));
         // Accumulate channels in order with fixed shuffle indices.
