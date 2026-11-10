@@ -79,7 +79,7 @@ foreach(shader gemm_fast channel_fast channel_av softmax norm depthwise copy)
 endforeach()
 upscaler_shader(anime window_qk window.comp -DQK)
 upscaler_shader(anime window_av window.comp)
-foreach(op 2 3 4 6 7 8 9 11)
+foreach(op 2 3 4 6 7 8 9)
     upscaler_shader(anime "op${op}" ops.comp "-DOP=${op}")
 endforeach()
 upscaler_shader(anime conv_win_in ../live/winograd.comp -DOP=0 -DANIME)
@@ -90,7 +90,10 @@ upscaler_shader(live conv_win_in winograd.comp -DOP=0)
 upscaler_shader(live conv_win_mul winograd.comp -DOP=1)
 upscaler_shader(live conv_win_out winograd.comp -DOP=2)
 upscaler_shader(live pack pack.comp)
-upscaler_shader(live output output.comp)
+upscaler_shader(common output4 output4.comp)
+upscaler_shader(common fullscreen fullscreen.vert)
+upscaler_shader(common lanczos_h lanczos.frag -DPASS=1)
+upscaler_shader(common lanczos_v lanczos.frag -DPASS=2)
 file(GENERATE OUTPUT "${manifest}" CONTENT "${resource_manifest}")
 
 add_custom_command(OUTPUT "${generated}/resources.S" "${generated}/resources.cpp"
@@ -101,7 +104,7 @@ add_custom_command(OUTPUT "${generated}/resources.S" "${generated}/resources.cpp
 
 add_executable(upscaler
     src/main.cpp
-    src/options.cpp src/upscale.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp src/image_io.cpp
+    src/options.cpp src/upscale.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp src/downscale.cpp src/image_io.cpp
     src/networks/dat.cpp src/networks/rrdb.cpp
     "${generated}/resources.cpp" "${generated}/resources.S")
 target_compile_features(upscaler PRIVATE cxx_std_20)

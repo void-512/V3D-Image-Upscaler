@@ -236,11 +236,7 @@ public:
     }
     void recordOutput(int scale)
     {
-        Params p{};
-        p[0] = H;
-        p[1] = W;
-        p[2] = scale;
-        op(11, norm, {}, output, p, (N * scale * scale * 3 + 63) / 64);
+        downscale.record(norm, output, H, W, scale, Model::Anime);
     }
 };
 

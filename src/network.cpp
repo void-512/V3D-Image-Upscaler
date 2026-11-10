@@ -7,7 +7,7 @@
 
 namespace upscaler {
 
-Network::Network(Gpu& device, Model model, const char* magic) : gpu(device)
+Network::Network(Gpu& device, Model model, const char* magic) : gpu(device), downscale(device)
 {
     const Resource blob = embeddedResource(std::string(modeName(model)) + "/model");
     size_t offset = 0;
@@ -72,13 +72,16 @@ int liveStripRows(int h, int w)
 
 uint64_t estimatedMemory(Model model, int h, int w, int scale)
 {
+    // 4H * 2W * RGBA32: reserve for the largest Lanczos intermediate, also
+    // when initial 4x inference is followed by additional output scales.
+    constexpr int outputScratch = 32;
     if (model == Model::Anime)
     {
         const uint64_t n = uint64_t(h) * w, padded = (n + 3) / 4 * 4;
         const uint64_t tiles = (uint64_t((h + 3) / 4) * ((w + 3) / 4) + 3) / 4 * 4;
         const uint64_t win = std::min(tiles, uint64_t(animeWinogradTiles)) * 36 * 180;
         const uint64_t windows = uint64_t((h + 15) / 16 * 16) * ((w + 15) / 16 * 16) / 128;
-        return (n * (544 + scale * scale * 3) + padded * 360
+        return (n * (544 + scale * scale * 3 + outputScratch) + padded * 360
                 + std::max({n * 540, uint64_t(5400), win})
                 + padded * 180
                 + std::max({(n + 255) / 256 * 5400, win, std::min(windows, uint64_t(animeAttentionWindows)) * 49152})) * 4
@@ -87,7 +90,7 @@ uint64_t estimatedMemory(Model model, int h, int w, int scale)
     const uint64_t pixels = uint64_t(h) * w;
     const uint64_t tiles = (uint64_t((h + 3) / 4) * ((w + 3) / 4) + 3) / 4 * 4;
     const int strip = liveStripRows(h, w);
-    return pixels * (3 + 3 * 64 + scale * scale * 3) * 4
+    return pixels * (3 + 3 * 64 + scale * scale * 3 + outputScratch) * 4
            + std::max(pixels * 192, uint64_t(std::min(h * 4, strip + 2)) * w * 256) * 4
            + (std::max(pixels * 256, tiles * 36 * 192)
               + std::max(uint64_t(std::min(h * 4, strip + 4)) * w * 256, tiles * 36 * 64)) * 4

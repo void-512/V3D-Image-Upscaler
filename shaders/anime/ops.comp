@@ -56,15 +56,5 @@ void main() {
     float m=-3.402823e38;for(int j=0;j<30;j++)m=max(m,a[i*30+j]);
     float z=0.0;for(int j=0;j<30;j++)z+=exp(a[i*30+j]-m);
     for(int j=0;j<30;j++)o[i*30+j]=exp(a[i*30+j]-m)/z;
-#elif OP == 11
-    // Pixel shuffle, mean restoration; 1x/2x are box downsamples of the 4x output.
-    if(i>=p[0]*p[1]*p[2]*p[2]*3)return;
-    int c=i%3, pix=i/3, y=pix/(p[1]*p[2]),x=pix%(p[1]*p[2]);
-    int base=((y/p[2])*p[1]+x/p[2])*48+c*16;
-    float v;
-    if(p[2]==4)v=a[base+(y%4)*4+x%4];
-    else if(p[2]==2) {int off=(y%2)*8+(x%2)*2;v=0.25*(a[base+off]+a[base+off+1]+a[base+off+4]+a[base+off+5]);}
-    else { v=0.; for(int j=0;j<16;j++)v+=a[base+j]; v*=1./16.; }
-    o[i]=v+(c==0?0.4488:c==1?0.4371:0.4040);
 #endif
 }

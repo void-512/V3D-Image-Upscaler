@@ -42,14 +42,27 @@ Gpu::Gpu(Model model) : shaderPrefix(std::string(modeName(model)) + "/")
     std::vector<VkQueueFamilyProperties> families(count);
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families.data());
     uint32_t family = 0;
-    while (family < count && !(families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) family++;
-    if (family == count) throw std::runtime_error("No compute queue");
+    constexpr auto queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT;
+    while (family < count && (families[family].queueFlags & queueFlags) != queueFlags) family++;
+    if (family == count) throw std::runtime_error("No graphics/compute queue");
     float priority = 1;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family;
     qi.queueCount = 1;
     qi.pQueuePriorities = &priority;
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &features13;
+    vkGetPhysicalDeviceFeatures2(physical, &features);
+    if (!features13.dynamicRendering || !features.features.fragmentStoresAndAtomics)
+        throw std::runtime_error("Lanczos requires dynamic rendering and fragment storage writes");
+    features13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    features13.dynamicRendering = VK_TRUE;
+    VkPhysicalDeviceFeatures enabled{};
+    enabled.fragmentStoresAndAtomics = VK_TRUE;
+    di.pNext = &features13;
+    di.pEnabledFeatures = &enabled;
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
     check(vkCreateDevice(physical, &di, nullptr, &device));
@@ -131,6 +144,11 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
 {
     std::string key = name;
     std::vector<VkSpecializationMapEntry> entries;
+    if (name == "output4")
+    {
+        key += "_" + std::to_string(p[3]);
+        entries.push_back({3, 12, 4});
+    }
     if (name == "gemm_fast")
         for (int i : {0, 1, 2, 3, 4, 7, 8, 9, 10, 11})
         {
@@ -156,7 +174,8 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
             entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
         }
     if (pipelines.count(key)) return pipelines.at(key);
-    const Resource code = embeddedResource(shaderPrefix + name);
+    const bool common = name == "output4";
+    const Resource code = embeddedResource((common ? "common/" : shaderPrefix) + name);
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = code.size;
     mi.pCode = reinterpret_cast<const uint32_t*>(code.data);
@@ -205,7 +224,7 @@ void Gpu::begin()
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t x, uint32_t y, uint32_t z)
@@ -251,7 +270,7 @@ void Gpu::finish()
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
     check(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;

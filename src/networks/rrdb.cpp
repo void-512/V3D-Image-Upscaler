@@ -130,12 +130,7 @@ public:
     }
     void recordOutput(int scale)
     {
-        Params p{};
-        p[0] = H;
-        p[1] = W;
-        p[2] = scale;
-        int groups = (N * scale * scale * 3 + 191) / 192, gx = std::min(groups, 65535);
-        gpu.dispatch("output", {rgb, {}, output, {}, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
+        downscale.record(rgb, output, H, W, scale, Model::Live);
     }
 };
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gpu.h"
+#include "downscale.h"
 
 namespace upscaler {
 
@@ -26,6 +26,7 @@ protected:
     void dump(BufferPtr buffer, const std::string& name, int count);
 
     Gpu& gpu;
+    Downscale downscale;
     BufferPtr weights;
     std::map<std::string, std::pair<int, int> > tensors;
 };
