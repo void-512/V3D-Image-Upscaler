@@ -66,6 +66,7 @@ public:
             const int tiles = ((H + 3) / 4) * ((W + 3) / 4);
             p[13] = (W + 3) / 4;
             p[15] = ic;
+            p[21] = modelVersion >= 2;
             // Bound transform scratch; each batch still reads the full image.
             for (int first = 0; first < tiles; first += animeWinogradTiles)
             {
@@ -88,6 +89,7 @@ public:
         p[9] = offset;
         p[10] = bool(add);
         p[11] = packed;
+        p[12] = modelVersion >= 2 && packed && ic == 180 && (oc == 180 || oc == 360);
         int tile = 192;
         gpu.dispatch("gemm_fast",
                      {in, {}, out, weights, add, {}}, p, (oc + 15) / 16, (p[0] * p[1] + tile - 1) / tile, 1);

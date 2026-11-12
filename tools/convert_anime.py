@@ -53,7 +53,8 @@ def convert(checkpoint, destination):
                 weight *= scale.reshape([-1] + [1] * (weight.ndim - 1))
                 bias = (bias - bn.running_mean) * scale + bn.bias
             if weight.ndim == 4 and weight.shape[1:] == (180, 3, 3):
-                tensors[name + '.winograd'] = (G @ weight @ G.t()).permute(2, 3, 1, 0).contiguous()
+                transformed = (G @ weight @ G.t()).permute(2, 3, 1, 0).contiguous()
+                tensors[name + '.winograd'] = transformed.reshape(36, 180, weight.shape[0] // 4, 4).permute(0, 2, 1, 3).contiguous()
                 tensors[name + '.bias'] = bias
                 continue
             if weight.ndim == 4:
@@ -61,6 +62,9 @@ def convert(checkpoint, destination):
                 weight = weight.permute(2, 3, 1, 0).contiguous()
             else:
                 weight = weight.t().contiguous()
+                if name.endswith(('.attn.proj', '.ffn.fc1', '.ffn.fc2')):
+                    assert weight.shape[0] == 180 and weight.shape[1] in (180, 360)
+                    weight = weight.reshape(180, weight.shape[1] // 4, 4).permute(1, 0, 2).contiguous()
             tensors[name + '.weight'] = weight
             tensors[name + '.bias'] = bias
         elif isinstance(module, torch.nn.LayerNorm):
@@ -87,19 +91,20 @@ def convert(checkpoint, destination):
         offset += arr.size
     with destination.open('wb') as f:
         f.write(b'APISRDAT')
-        f.write(struct.pack('<III', 1, len(entries), offset))
+        f.write(struct.pack('<III', 2, len(entries), offset))
         for name, start, count in entries:
             encoded = name.encode()
             f.write(struct.pack('<III', len(encoded), start, count))
             f.write(encoded)
         for arr in arrays:
             f.write(arr.tobytes())
-    metadata = {'format': 1, 'checkpoint_sha256': hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
+    metadata = {'format': 2, 'checkpoint_sha256': hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
                 'model_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
                 'floats': offset, 'tensors': len(entries), 'precision': 'float32',
                 'transforms': ['evaluation BatchNorm folding', 'constant relative-position bias evaluation',
                                'NHWC convolution and transposed linear weights',
-                               '16-byte-aligned tensor starts', 'FP32 F(4x4,3x3) Winograd convolutions']}
+                               '16-byte-aligned tensor starts', 'FP32 F(4x4,3x3) Winograd convolutions',
+                               'quad-contiguous FP32 projection/FFN and Winograd weights']}
     destination.with_suffix('.json').write_text(json.dumps(metadata, indent=2) + '\n')
     print(json.dumps(metadata, indent=2))
 

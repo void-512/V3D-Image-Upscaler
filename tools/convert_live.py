@@ -32,9 +32,24 @@ def convert(checkpoint, destination):
         if value.ndim == 4:
             if name.startswith('body.') or name == 'conv_body.weight':
                 transformed = G @ value @ G.t()
-                tensors[name.replace('.weight', '.winograd')] = transformed.permute(2, 3, 1, 0).contiguous()
+                transformed = transformed.permute(2, 3, 1, 0).contiguous()
+                if value.shape[:2] == (64, 192):
+                    transformed = transformed.reshape(36, 192, 16, 4).permute(0, 2, 1, 3).contiguous()
+                tensors[name.replace('.weight', '.winograd')] = transformed
                 continue
             value = value.permute(2, 3, 1, 0).contiguous()
+            if name in ('conv_up1.weight', 'conv_up2.weight'):
+                # Nearest-neighbour 2x expansion repeats input samples. Sum
+                # their 3x3 coefficients into four parity-specific 2x2 kernels.
+                phase = torch.zeros((2, 2, 2, 2, 64, 64), dtype=torch.float32)
+                for py in range(2):
+                    for px in range(2):
+                        for ky in range(3):
+                            for kx in range(3):
+                                iy = (ky + py - 1) // 2 + 1 - py
+                                ix = (kx + px - 1) // 2 + 1 - px
+                                phase[py, px, iy, ix] += value[ky, kx]
+                tensors[name.replace('.weight', '.polyphase')] = phase
         tensors[name] = value
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -50,18 +65,19 @@ def convert(checkpoint, destination):
         offset += arr.size
     with destination.open('wb') as f:
         f.write(b'RRDBV3D!')
-        f.write(struct.pack('<III', 1, len(entries), offset))
+        f.write(struct.pack('<III', 2, len(entries), offset))
         for name, start, count in entries:
             encoded = name.encode()
             f.write(struct.pack('<III', len(encoded), start, count))
             f.write(encoded)
         for arr in arrays:
             f.write(arr.tobytes())
-    metadata = {'format': 1, 'checkpoint_sha256': hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
+    metadata = {'format': 2, 'checkpoint_sha256': hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
                 'model_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
                 'floats': offset, 'tensors': len(entries), 'precision': 'float32',
                 'transforms': ['NHWC convolution weights', '16-byte-aligned tensor starts'] +
-                              ['FP32 F(4x4,3x3) Winograd trunk weights'],
+                              ['FP32 F(4x4,3x3) Winograd trunk weights', 'FP32 polyphase 2x upsampling kernels',
+                               'quad-contiguous FP32 192-to-64 Winograd weights'],
                 'checkpoint_key': 'params_ema', 'architecture': 'RRDBNet(3,3,64,23,32,scale=4)'}
     destination.with_suffix('.json').write_text(json.dumps(metadata, indent=2) + '\n')
     print(json.dumps(metadata, indent=2))

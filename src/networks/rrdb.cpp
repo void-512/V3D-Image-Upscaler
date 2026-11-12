@@ -63,12 +63,26 @@ public:
             // Transform only the newly appended 32 channels at each growth step.
             p[14] = ic == 64 ? 0 : ic - 32;
             p[15] = ic == 64 ? 64 : 32;
+            p[21] = modelVersion >= 2 && ic == 192 && oc == 64;
             int groups = (p[12] * p[15] + 191) / 192, gx = std::min(groups, 65535);
             gpu.dispatch("conv_win_in", {in, {}, winIn, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
             gpu.dispatch("conv_win_mul", {winIn, {}, winOut, weights, {}, {}}, p, (oc + 15) / 16, 3 * ((p[12] + 15) / 16), 1);
             groups = (tiles * oc + 191) / 192;
             gx = std::min(groups, 65535);
             gpu.dispatch("conv_win_out", {winOut, {}, out, weights, add, mode == 3 ? saved : BufferPtr{}}, p, gx, (groups + gx - 1) / gx, 1);
+            return;
+        }
+        if (up == 2 && tensors.contains(name + ".polyphase"))
+        {
+            // Four parity-specific 2x2 convolutions replace nearest-neighbour
+            // expansion followed by a 3x3 convolution. All weights stay FP32.
+            for (int phase = 0; phase < 4; ++phase)
+            {
+                p[5] = at(name + ".polyphase") + phase * 4 * ic * oc;
+                p[20] = phase;
+                gpu.dispatch("conv_poly", {in, {}, out, weights, add, {}}, p,
+                             (oc + 15) / 16, (p[17] * w / 4 + 191) / 192, 1);
+            }
             return;
         }
         p[5] = tensors.at(name + ".weight").first;

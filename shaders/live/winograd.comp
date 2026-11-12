@@ -27,6 +27,7 @@ layout(constant_id=12) const int T=64;
 layout(constant_id=13) const int TW=8;
 layout(constant_id=14) const int FIRST=0;
 layout(constant_id=15) const int COUNT=64;
+layout(constant_id=21) const int WPACKED=0;
 
 #ifdef ANIME
 #define WINSTRIDE IC
@@ -68,40 +69,35 @@ void main(){
         for(int y=0;y<6;y++)o[(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4]=q[y];
     }
 #elif OP == 1
-    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
-    // Flatten transform planes and tile rows so small images do not waste
-    // most of a 12-subgroup workgroup on out-of-range tiles in every plane.
-    int subgroup=int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y);
-    int row=(subgroup%((T+15)/16))*16,col=int(gl_WorkGroupID.x)*16,plane=subgroup/((T+15)/16);
+    uint lane=gl_SubgroupInvocationID,mi=lane>>2,ni=lane&3u;
+    uint subgroup=gl_WorkGroupID.y*12u+gl_SubgroupID;
+    uint row=(subgroup%uint((T+15)/16))*16u,col=gl_WorkGroupID.x*16u,plane=subgroup/uint((T+15)/16);
+    // Each lane owns a 4x4 output block. A and B start at the same K phase.
+    // Compute locally once, then rotate both operands three times. The loads
+    // are unchanged; FP32 summation order changes within each four-channel group.
+    uint phase=(mi+ni)&3u;
+    uint ai=(plane*uint(T/4)+min((row>>2)+mi,uint(T/4-1)))*uint(WINSTRIDE)+phase;
+    uint cq=min((col>>2)+ni,uint(OC/4-1));
+    uint bi=uint(p[5])/4u+(WPACKED!=0?(plane*uint(OC/4)+cq)*uint(IC)+phase:(plane*uint(IC)+phase)*uint(OC/4)+cq);
+    uint bs=WPACKED!=0?4u:uint(OC);
+    uint ar=mi*4u+((ni+1u)&3u),br=((mi+1u)&3u)*4u+ni;
     vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
-    for(int k=0;k<IC;k+=4) {
-        int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
-        vec4 av=a4[(plane*T/4+min(rr,T-4)/4)*WINSTRIDE+kk];
-        vec4 bv=w4[(p[5]+(plane*IC+kk)*OC+min(cc,OC-4))/4];
-        // Accumulate four input channels with fixed shuffle indices.
-        {
-            vec4 aa=subgroupShuffle(av,mi*4+0),bb=subgroupShuffle(bv,ni*4+0);
-            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
-        }
-        {
-            vec4 aa=subgroupShuffle(av,mi*4+1),bb=subgroupShuffle(bv,ni*4+1);
-            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
-        }
-        {
-            vec4 aa=subgroupShuffle(av,mi*4+2),bb=subgroupShuffle(bv,ni*4+2);
-            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
-        }
-        {
-            vec4 aa=subgroupShuffle(av,mi*4+3),bb=subgroupShuffle(bv,ni*4+3);
-            s0+=aa.x*bb;s1+=aa.y*bb;s2+=aa.z*bb;s3+=aa.w*bb;
-        }
+    for(uint k=0u;k<uint(IC);k+=4u){
+        vec4 av=a4[ai+k],bv=w4[bi+k/4u*bs];
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+        av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+        av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+        av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
     }
-    int r=row+mi*4,c=col+ni*4;
-    if(c<OC){
-        if(r<T)o4[((plane*T+r)*OC+c)/4]=s0;
-        if(r+1<T)o4[((plane*T+r+1)*OC+c)/4]=s1;
-        if(r+2<T)o4[((plane*T+r+2)*OC+c)/4]=s2;
-        if(r+3<T)o4[((plane*T+r+3)*OC+c)/4]=s3;
+    uint r=row+mi*4u,c=col+ni*4u;
+    if(c<uint(OC)){
+        if(r<uint(T))o4[((plane*uint(T)+r)*uint(OC)+c)/4u]=s0;
+        if(r+1u<uint(T))o4[((plane*uint(T)+r+1u)*uint(OC)+c)/4u]=s1;
+        if(r+2u<uint(T))o4[((plane*uint(T)+r+2u)*uint(OC)+c)/4u]=s2;
+        if(r+3u<uint(T))o4[((plane*uint(T)+r+3u)*uint(OC)+c)/4u]=s3;
     }
 #else
     int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);

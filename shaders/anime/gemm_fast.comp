@@ -21,6 +21,8 @@ layout(constant_id=8) const int STRIDE=180;
 layout(constant_id=9) const int OFFSET=0;
 layout(constant_id=10) const int ADD=0;
 layout(constant_id=11) const int PACKED=0;
+// Model v2 packs selected weights as [OC/4,IC,4] for contiguous quad loads.
+layout(constant_id=12) const int WPACKED=0;
 float input_at(int row,int k) {
     if(row>=H*W||k>=IC*KS*KS)return 0.0;
     if(KS==1)return a[row*STRIDE+OFFSET+k];
@@ -40,19 +42,26 @@ void store_row(int r,int c,vec4 value){
     if(ADD!=0)value+=d4[(r*OC+c)/4];
     o4[(r*OC+c)/4]=value;
 }
-void main(){
-    int lane=int(gl_SubgroupInvocationID),mi=lane/4,ni=lane%4;
-    int row=(int(gl_WorkGroupID.y)*12+int(gl_LocalInvocationID.y))*16;
+void generic_main(){
+    int lane=int(gl_SubgroupInvocationID),mi=lane>>2,ni=lane&3;
+    int row=(int(gl_WorkGroupID.y)*12+int(gl_SubgroupID))*16;
     int col=int(gl_WorkGroupID.x)*16;
+    // Hoist nonnegative buffer offsets: signed division in the reduction loop
+    // expands into several QPU instructions on V3D.
+    uint inputBase=min((uint(row)>>2)+uint(mi),uint((H*W-1)/4))*uint(IC)+uint(ni);
+    uint weightQuad=min((uint(col)>>2)+uint(mi),uint(max(OC/4-1,0)));
+    uint weightBase=uint(p[5])/4u+(WPACKED!=0?weightQuad*uint(IC)+uint(ni):uint(ni)*uint(OC/4)+weightQuad);
+    uint weightStep=WPACKED!=0?4u:uint(OC);
     vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
     for(int k=0;k<IC*KS*KS;k+=4){
         int kk=k+lane%4,rr=row+(lane/4)*4,cc=col+(lane/4)*4;
         vec4 av;
-        if(PACKED!=0 && ACT==0 && IC%4==0)av=a4[(min(rr,((H*W-1)/4)*4)/4)*IC+kk];
+        // Inactive rows/columns never reach the store, for every activation.
+        if(PACKED!=0 && IC%4==0)av=a4[inputBase+uint(k)];
         else if(PACKED!=0)av=(rr<H*W&&kk<IC)?a4[(rr/4)*IC+kk]:vec4(0);
         else av=vec4(input_at(rr,kk),input_at(rr+1,kk),input_at(rr+2,kk),input_at(rr+3,kk));
         vec4 bv;
-        if(PACKED!=0 && ACT==0 && IC%4==0 && OC%4==0)bv=(kk<IC*KS*KS)?w4[(p[5]+kk*OC+min(cc,OC-4))/4]:vec4(0);
+        if(PACKED!=0 && IC%4==0 && OC%4==0)bv=w4[weightBase+(uint(k)/4u)*weightStep];
         else if(OC%4==0)bv=(kk<IC*KS*KS&&cc<OC)?w4[(p[5]+kk*OC+cc)/4]:vec4(0);
         else
         bv=vec4(weight_at(kk,cc),weight_at(kk,cc+1),weight_at(kk,cc+2),weight_at(kk,cc+3));
@@ -85,4 +94,34 @@ void main(){
             if(ACT==1)v=gelu(v);if(ACT==2)v=sigmoid(v);if(ADD!=0)v+=d[r*OC+c];o[r*OC+c]=v;
         }
     }
+}
+void main(){
+    if(PACKED==0){generic_main();return;}
+    if(IC%4!=0){generic_main();return;}
+    if(OC%4!=0){generic_main();return;}
+    if(KS!=1){generic_main();return;}
+    uint lane=gl_SubgroupInvocationID,mi=lane>>2,ni=lane&3u;
+    uint row=(gl_WorkGroupID.y*12u+gl_SubgroupID)*16u,col=gl_WorkGroupID.x*16u;
+    // Each lane owns a 4x4 output block. A and B start at the same K phase.
+    // Compute locally once, then rotate both operands three times. The loads
+    // are unchanged; FP32 summation order changes within each four-channel group.
+    uint phase=(mi+ni)&3u;
+    uint ai=min((row>>2)+mi,uint((H*W-1)/4))*uint(IC)+phase;
+    uint cq=min((col>>2)+ni,uint(OC/4-1));
+    uint bi=uint(p[5])/4u+(WPACKED!=0?cq*uint(IC)+phase:phase*uint(OC/4)+cq);
+    uint bs=WPACKED!=0?4u:uint(OC);
+    uint ar=mi*4u+((ni+1u)&3u),br=((mi+1u)&3u)*4u+ni;
+    vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
+    for(uint k=0u;k<uint(IC);k+=4u){
+        vec4 av=a4[ai+k],bv=w4[bi+k/4u*bs];
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+        av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+        av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+        av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
+        s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
+    }
+    int r=int(row+mi*4u),c=int(col+ni*4u);
+    store_row(r,c,s0);store_row(r+1,c,s1);store_row(r+2,c,s2);store_row(r+3,c,s3);
 }

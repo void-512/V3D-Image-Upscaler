@@ -22,7 +22,9 @@ Network::Network(Gpu& device, Model model, const char* magic) : gpu(device), dow
         std::memcpy(&value, take(4), 4);
         return value;
     };
-    if (std::memcmp(take(8), magic, 8) || read32() != 1) throw std::runtime_error("Invalid embedded model");
+    if (std::memcmp(take(8), magic, 8)) throw std::runtime_error("Invalid embedded model");
+    modelVersion = read32();
+    if (modelVersion != 1 && modelVersion != 2) throw std::runtime_error("Invalid embedded model version");
     const uint32_t count = read32(), floats = read32();
     if (count > 4096 || floats > 70000000) throw std::runtime_error("Invalid embedded model size");
     for (uint32_t i = 0; i < count; ++i)

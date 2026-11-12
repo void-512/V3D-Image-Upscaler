@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -46,8 +47,12 @@ public:
     std::map<std::string, VkPipeline> pipelines;
     BufferPtr dummy;
     std::string shaderPrefix;
+    uint32_t queueFamily = 0;
+    bool uniformInputAlias = false;
+    // Optional benchmark instrumentation; empty in normal inference.
+    std::function<void(const std::string&, const Params&, bool)> observeDispatch;
 
-    explicit Gpu(Model model);
+    explicit Gpu(Model model, bool performanceQueries = false, bool uniformAlias = false);
 
     ~Gpu();
 

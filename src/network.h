@@ -26,6 +26,7 @@ protected:
     void dump(BufferPtr buffer, const std::string& name, int count);
 
     Gpu& gpu;
+    uint32_t modelVersion = 0;
     Downscale downscale;
     BufferPtr weights;
     std::map<std::string, std::pair<int, int> > tensors;

@@ -8,7 +8,7 @@ void check(VkResult r)
 {
     if (r != VK_SUCCESS) throw std::runtime_error("Vulkan error " + std::to_string(r));
 }
-Gpu::Gpu(Model model) : shaderPrefix(std::string(modeName(model)) + "/")
+Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias) : shaderPrefix(std::string(modeName(model)) + "/"), uniformInputAlias(uniformAlias)
 {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "Pi 5 Upscaler";
@@ -45,6 +45,7 @@ Gpu::Gpu(Model model) : shaderPrefix(std::string(modeName(model)) + "/")
     constexpr auto queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT;
     while (family < count && (families[family].queueFlags & queueFlags) != queueFlags) family++;
     if (family == count) throw std::runtime_error("No graphics/compute queue");
+    queueFamily = family;
     float priority = 1;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family;
@@ -62,6 +63,19 @@ Gpu::Gpu(Model model) : shaderPrefix(std::string(modeName(model)) + "/")
     VkPhysicalDeviceFeatures enabled{};
     enabled.fragmentStoresAndAtomics = VK_TRUE;
     di.pNext = &features13;
+    VkPhysicalDevicePerformanceQueryFeaturesKHR perf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR};
+    const char* perfExtension = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
+    if (performanceQueries)
+    {
+        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        supported.pNext = &perf;
+        vkGetPhysicalDeviceFeatures2(physical, &supported);
+        if (!perf.performanceCounterQueryPools) throw std::runtime_error("Performance queries unavailable");
+        perf.performanceCounterMultipleQueryPools = VK_FALSE;
+        features13.pNext = &perf;
+        di.enabledExtensionCount = 1;
+        di.ppEnabledExtensionNames = &perfExtension;
+    }
     di.pEnabledFeatures = &enabled;
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
@@ -76,16 +90,16 @@ Gpu::Gpu(Model model) : shaderPrefix(std::string(modeName(model)) + "/")
     ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ca.commandBufferCount = 1;
     check(vkAllocateCommandBuffers(device, &ca, &cmd));
-    std::array<VkDescriptorSetLayoutBinding, 8> binds{};
-    for (int i = 0; i < 8; i++)
+    std::array<VkDescriptorSetLayoutBinding, 9> binds{};
+    for (int i = 0; i < 8 + int(uniformInputAlias); i++)
     {
         binds[i].binding = i;
-        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binds[i].descriptorType = i == 8 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1;
         binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    si.bindingCount = 8;
+    si.bindingCount = 8 + int(uniformInputAlias);
     si.pBindings = binds.data();
     check(vkCreateDescriptorSetLayout(device, &si, nullptr, &setLayout));
     VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params)};
@@ -123,6 +137,7 @@ BufferPtr Gpu::buffer(size_t floats)
     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     ci.size = bytes;
     ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (uniformInputAlias) ci.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     check(vkCreateBuffer(device, &ci, nullptr, &b->buffer));
     VkMemoryRequirements mr;
@@ -150,12 +165,12 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
         entries.push_back({3, 12, 4});
     }
     if (name == "gemm_fast")
-        for (int i : {0, 1, 2, 3, 4, 7, 8, 9, 10, 11})
+        for (int i : {0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12})
         {
             key += "_" + std::to_string(p[i]);
             entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
         }
-    if (name == "window_qk" || name == "window_av")
+    if (name.rfind("window_", 0) == 0)
         for (int i = 0; i <= 8; i++)
         {
             key += "_" + std::to_string(p[i]);
@@ -168,7 +183,7 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
             entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
         }
     if (name.rfind("conv", 0) == 0)
-        for (int i : {0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15})
+        for (int i : {0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21})
         {
             key += "_" + std::to_string(p[i]);
             entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
@@ -205,11 +220,11 @@ void Gpu::reserveDispatches(uint32_t count)
     if (descriptors) vkDestroyDescriptorPool(device, descriptors, nullptr);
     descriptors = VK_NULL_HANDLE;
     dispatchCapacity = std::bit_ceil(count);
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 * dispatchCapacity};
+    VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 * dispatchCapacity}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, dispatchCapacity}};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = dispatchCapacity;
-    dp.poolSizeCount = 1;
-    dp.pPoolSizes = &ps;
+    dp.poolSizeCount = 1 + int(uniformInputAlias);
+    dp.pPoolSizes = ps;
     check(vkCreateDescriptorPool(device, &dp, nullptr, &descriptors));
 }
 
@@ -238,11 +253,11 @@ void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, co
     ai.pSetLayouts = &setLayout;
     VkDescriptorSet ds;
     check(vkAllocateDescriptorSets(device, &ai, &ds));
-    std::array<VkDescriptorBufferInfo, 8> info;
-    std::array<VkWriteDescriptorSet, 8> writes{};
-    for (int i = 0; i < 8; i++)
+    std::array<VkDescriptorBufferInfo, 9> info;
+    std::array<VkWriteDescriptorSet, 9> writes{};
+    for (int i = 0; i < 8 + int(uniformInputAlias); i++)
     {
-        int src = i < 6 ? i : i == 6 ? 0
+        int src = i < 6 ? i : i == 6 || i == 8 ? 0
                                      : 3;
         BufferPtr b = buffers[src] ? buffers[src] : dummy;
         info[i] = {b->buffer, 0, b->bytes};
@@ -250,10 +265,10 @@ void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, co
         writes[i].dstSet = ds;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorType = i == 8 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &info[i];
     }
-    vkUpdateDescriptorSets(device, 8, writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device, 8 + int(uniformInputAlias), writes.data(), 0, nullptr);
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -261,8 +276,10 @@ void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, co
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, nullptr);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params), p.data());
+    if (observeDispatch) observeDispatch(name, p, true);
     vkCmdDispatch(cmd, x, y, z);
     ++descriptorSetsUsed;
+    if (observeDispatch) observeDispatch(name, p, false);
 }
 
 void Gpu::finish()
