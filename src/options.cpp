@@ -101,11 +101,7 @@ const char* usage()
 Examples:
   upscaler input.jpg --live --scale 2 output.png
   upscaler -i input.png --anime -o anime.png -i photo.jpg --live --scale 2 -o photo.png
-
-Models are loaded from the runtime's share/upscaler/models directory.
-Without --config, config.toml is searched in the working directory, then the runtime root.
-Command-line tasks run before [[tasks]] entries. Each task produces an RGB PNG.
-Benchmark mode generates random RGB pixels at the command-line dimensions.
+  upscaler --benchmark --width 128 --height 96 --warmup 1 --loop 3
 )";
 }
 
