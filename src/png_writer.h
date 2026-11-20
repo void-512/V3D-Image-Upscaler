@@ -1,6 +1,5 @@
 #pragma once
-#include <fstream>
-#include <string>
+#include "output_file.h"
 #include <vector>
 #include <zlib.h>
 
@@ -17,11 +16,11 @@ public:
 private:
     void chunk(const char* type, const unsigned char* data, size_t size);
     void compress(int flush);
-    std::ofstream file, raw;
+    OutputFile file, raw;
     z_stream stream{};
     std::vector<unsigned char> row, compressed;
     std::vector<float> cachedRow;
     int width, height, written = 0;
-    bool initialized = false, finished = false;
+    bool finished = false;
 };
 } // namespace upscaler

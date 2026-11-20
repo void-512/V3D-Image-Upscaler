@@ -272,6 +272,7 @@ void Gpu::reserveDispatches(uint32_t count)
 
 void Gpu::begin()
 {
+    checkInterrupted();
     if (observeBatch) recordingStart = std::chrono::steady_clock::now();
     check(vkResetCommandPool(device, pool, 0));
     check(vkResetDescriptorPool(device, descriptors, 0));
@@ -287,6 +288,7 @@ void Gpu::begin()
 
 void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t x, uint32_t y, uint32_t z)
 {
+    checkInterrupted();
     if (descriptorSetsUsed >= dispatchCapacity) throw std::runtime_error("Too many dispatches");
     if (x > properties.limits.maxComputeWorkGroupCount[0] || y > properties.limits.maxComputeWorkGroupCount[1] || z > properties.limits.maxComputeWorkGroupCount[2]) throw std::runtime_error("Dispatch exceeds V3D limits; use --tile");
     VkPipeline pipe = pipeline(name, p);
@@ -335,6 +337,7 @@ void Gpu::dispatchLinear(const std::string& name, std::array<BufferPtr, 6> buffe
 
 void Gpu::finish()
 {
+    checkInterrupted();
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -344,8 +347,11 @@ void Gpu::finish()
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
     const auto submit = observeBatch ? std::chrono::steady_clock::now() : recordingStart;
+    checkInterrupted();
     check(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+    // Buffer and query-pool owners may unwind as soon as cancellation is observed.
     check(vkQueueWaitIdle(queue));
+    checkInterrupted();
     if (observeBatch)
     {
         using Milliseconds = std::chrono::duration<double, std::milli>;

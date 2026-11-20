@@ -184,7 +184,7 @@ add_custom_command(OUTPUT "${generated}/resources.S" "${generated}/resources.cpp
 add_executable(upscaler
     src/main.cpp
     src/runtime.cpp
-    src/config.cpp src/options.cpp src/upscale.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp src/downscale.cpp src/image_io.cpp
+    src/config.cpp src/options.cpp src/upscale.cpp src/output_file.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp src/downscale.cpp src/image_io.cpp
     src/networks/dat.cpp src/networks/rrdb.cpp
     "${generated}/resources.cpp" "${generated}/resources.S")
 target_compile_features(upscaler PRIVATE cxx_std_20)

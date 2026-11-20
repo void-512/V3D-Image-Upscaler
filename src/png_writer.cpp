@@ -1,4 +1,5 @@
 #include "png_writer.h"
+#include "runtime.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,39 +14,31 @@ void bigEndian(unsigned char* p, uint32_t value)
 }
 }
 PngWriter::PngWriter(const std::string& path, int w, int h, const std::string& rawPath)
-    : file(path, std::ios::binary), row(size_t(w) * 3 + 1), compressed(65536), cachedRow(size_t(w) * 3), width(w), height(h)
+    : file(path), raw(rawPath), row(size_t(w) * 3 + 1), compressed(65536), cachedRow(size_t(w) * 3), width(w), height(h)
 {
-    if (!file) throw std::runtime_error("Cannot write PNG output");
-    if (!rawPath.empty())
-    {
-        raw.open(rawPath, std::ios::binary);
-        if (!raw) throw std::runtime_error("Cannot write raw output");
-    }
-    if (deflateInit(&stream, 3) != Z_OK) throw std::runtime_error("Cannot initialize PNG compressor");
-    initialized = true;
+    if (!file.isOpen()) throw std::runtime_error("Cannot write PNG output");
     const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
-    file.write(reinterpret_cast<const char*>(signature), 8);
+    if (!file.write(signature, sizeof(signature))) throw std::runtime_error("Cannot write PNG output");
     unsigned char header[13] = {};
     bigEndian(header, w); bigEndian(header + 4, h);
     header[8] = 8; header[9] = 2;
     chunk("IHDR", header, sizeof(header));
+    if (deflateInit(&stream, 3) != Z_OK) throw std::runtime_error("Cannot initialize PNG compressor");
 }
 PngWriter::~PngWriter()
 {
-    if (initialized) deflateEnd(&stream);
+    deflateEnd(&stream);
 }
 void PngWriter::chunk(const char* type, const unsigned char* data, size_t size)
 {
     unsigned char value[4];
     bigEndian(value, size);
-    file.write(reinterpret_cast<const char*>(value), 4);
-    file.write(type, 4);
-    if (size) file.write(reinterpret_cast<const char*>(data), size);
+    if (!file.write(value, sizeof(value)) || !file.write(type, 4) || (size && !file.write(data, size)))
+        throw std::runtime_error("Cannot write PNG output");
     uLong crc = crc32(0, reinterpret_cast<const unsigned char*>(type), 4);
     if (size) crc = crc32(crc, data, size);
     bigEndian(value, crc);
-    file.write(reinterpret_cast<const char*>(value), 4);
-    if (!file) throw std::runtime_error("Cannot write PNG output");
+    if (!file.write(value, sizeof(value))) throw std::runtime_error("Cannot write PNG output");
 }
 void PngWriter::compress(int flush)
 {
@@ -63,12 +56,15 @@ void PngWriter::compress(int flush)
 void PngWriter::rows(const float* pixels, int first, int count)
 {
     if (first != written || first + count > height) throw std::runtime_error("Incorrect output row order");
-    if (raw.is_open() && !raw.write(reinterpret_cast<const char*>(pixels), size_t(count) * width * 3 * sizeof(float))) throw std::runtime_error("Cannot write raw output");
     for (int y = 0; y < count; ++y)
     {
+        checkInterrupted();
         // Stage one mapped GPU row in host memory before quantization.
-        std::memcpy(cachedRow.data(), pixels, cachedRow.size() * sizeof(float));
+        const size_t rowBytes = cachedRow.size() * sizeof(float);
+        std::memcpy(cachedRow.data(), pixels, rowBytes);
         pixels += cachedRow.size();
+        if (raw.isOpen() && !raw.write(cachedRow.data(), rowBytes))
+            throw std::runtime_error("Cannot write raw output");
         // PNG Sub filter: subtract the preceding pixel's matching channel.
         row[0] = 1;
         unsigned char previous[3] = {};
@@ -90,13 +86,16 @@ void PngWriter::finish()
 {
     if (finished) return;
     if (written != height) throw std::runtime_error("Incomplete PNG output");
+    checkInterrupted();
     stream.next_in = nullptr;
     stream.avail_in = 0;
     compress(Z_FINISH);
     chunk("IEND", nullptr, 0);
     file.close();
-    if (!file) throw std::runtime_error("Cannot finish PNG output");
-    if (raw.is_open()) { raw.close(); if (!raw) throw std::runtime_error("Cannot finish raw output"); }
+    raw.close();
+    checkInterrupted();
+    raw.publish();
+    file.publish();
     finished = true;
 }
 } // namespace upscaler

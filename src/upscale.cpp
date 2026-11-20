@@ -1,4 +1,5 @@
 #include "upscale.h"
+#include "runtime.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -10,8 +11,11 @@ void upload(Network& dat, Model model, const unsigned char* pixels, int width, i
     const float mean[3] = {0.4488f, 0.4371f, 0.4040f};
 
     for (int y = 0; y < dat.H; y++)
+    {
+        checkInterrupted();
         for (int x = 0; x < dat.W; x++)
             for (int c = 0; c < 3; c++) dst[(y * dat.W + x) * 3 + c] = pixels[((y + top) * width + x + left) * 3 + c] / 255.f - (model == Model::Anime ? mean[c] : 0.f);
+    }
 }
 
 namespace {
@@ -43,8 +47,12 @@ struct Band
     void flush(int end)
     {
         const size_t count = size_t(end - first) * width;
-        for (size_t i = 0; i < count; ++i)
-            for (int c = 0; c < 3; ++c) values[i * 3 + c] /= weights[i];
+        for (size_t row = 0; row < count; row += width)
+        {
+            checkInterrupted();
+            for (size_t i = row; i < row + width; ++i)
+                for (int c = 0; c < 3; ++c) values[i * 3 + c] /= weights[i];
+        }
         sink.rows(values.data(), first, end - first);
         const size_t remaining = size_t(last - end) * width;
         std::memmove(values.data(), values.data() + count * 3, remaining * 3 * sizeof(float));
@@ -88,6 +96,7 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
         if (timings) timings->blend += Milliseconds(Clock::now() - extendStart).count();
         for (size_t tx = 0; tx + 1 < xs.size(); ++tx)
         {
+            checkInterrupted();
             const int left = xs[tx], right = xs[tx + 1];
             const int x0 = std::max(left - halo, 0), x1 = std::min(right + halo, width);
             const int kx0 = std::max(left - blend, 0), kx1 = std::min(right + blend, width);
@@ -110,6 +119,8 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
                 const auto blendStart = Clock::now();
                 const auto* src = static_cast<const float*>(network.output->mapped);
                 for (int y = ky0 * scale; y < ky1 * scale; ++y)
+                {
+                    checkInterrupted();
                     for (int x = kx0 * scale; x < kx1 * scale; ++x)
                     {
                         const float xx = (x + .5f) / scale, yy = (y + .5f) / scale;
@@ -121,6 +132,7 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
                         band.weights[dst] += weight;
                         for (int c = 0; c < 3; ++c) band.values[dst * 3 + c] += src[source * 3 + c] * weight;
                     }
+                }
                 if (timings) timings->blend += Milliseconds(Clock::now() - blendStart).count();
             }
             std::cerr << "Tile " << ty * (xs.size() - 1) + tx + 1 << '/' << (ys.size() - 1) * (xs.size() - 1)
