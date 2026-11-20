@@ -1,11 +1,10 @@
-# Pi 5 Image Upscaler
+# Pi Image Upscaler
 
-A Raspberry Pi 5 Vulkan image upscaler running on GPU.
+A Raspberry Pi Vulkan image upscaler running on GPU.
 
 ```sh
-upscaler input.jpg --live --scale 2 output.png
-upscaler input.png --anime --scale 4 output.png
-upscaler input.jpg --live --scale 1 restored.png
+upscaler INPUT.jpg --live --scale 2 OUTPUT.png
+upscaler INPUT.png --anime OUTPUT.png
 ```
 
 | Mode | Model | Intended input |
@@ -15,51 +14,28 @@ upscaler input.jpg --live --scale 1 restored.png
 
 ## Build
 
-Requirements:
+- C/C++20 toolchain, Git, CMake 3.20+, Ninja, Meson, pkg-config, Vulkan headers, and `glslc`.
+- Python with Mako and packaging.
+- Development libraries for libdrm, libudev, Expat, and Zstandard.
 
-- ARM64 Linux on Raspberry Pi 5, with the Vulkan 1.3 V3DV runtime.
-- Git, CMake, Make/Ninja, and C/C++20 compilers.
-- Vulkan development files and `glslc`.
-- Python with CPU PyTorch
+The project uses a customized mesa that packs 2 fp16 data into a single fp32 datapath to achieve 2x fp16 performance. So it will need its own vulkan driver.
 
-Use a Python environment with the conversion dependencies installed. For the
-existing `.venv`, the build commands are:
+The build looks for local checkpoints in `models/checkpoints/` and downloads missing ones. Install the [Python conversion dependencies](tools/requirements.txt) to build from checkpoints. Set `UPSCALER_MODELS_DIR` to use checkpoints or prepacked weights from another directory.
 
 ```sh
 git submodule update --init --recursive
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
-cmake --build build --target upscaler --parallel 6
+cmake -S . -B build -G Ninja
+cmake --build build
 ```
+
+`build/product/` contains `upscaler` and `libvulkan_broadcom.so`. Keep them together. The executable embeds the models and shaders.
+
+## Configuration
+
+Use [config.toml](config.toml) to set inference options or queue images. Pass `--config FILE` to select a file. By default, the program looks in the working directory, then beside the executable.
+
+Repeat `-i INPUT --live -o OUTPUT` or `-i INPUT --anime -o OUTPUT` to queue tasks. Command-line tasks run before entries from the config. Paths in the config are relative to that file.
 
 ## Memory and tiling
 
-Full-frame inference preserves the complete image context. When the estimated GPU
-working set exceeds 2 GiB or the anime attention estimate exceeds 1 GiB, inference uses balanced tiles with
-576-pixel cores and 96-pixel halos for live mode, or 448-pixel cores and 48-pixel
-halos for anime mode. Tile and halo sizes must be multiples of 16. Overlapping
-outputs are feathered.
-
-Tiled inference is approximate: anime attention depends on the whole image, and
-finite halos can omit convolution context. Use `--tile 0` for full-frame inference
-when memory permits. Explicit Vulkan working sets are limited to 3 GiB, and each
-tensor must fit the device's storage-buffer limit.
-
-```sh
-upscaler input.png --anime --tile 0 output.png
-upscaler input.jpg --live --tile 576 --halo 96 output.png
-```
-
-## Source layout
-
-```text
-src/                 CLI, image I/O, Vulkan runtime and model reader
-src/networks/        DAT and RRDB inference schedules
-shaders/anime/       DAT kernels
-shaders/live/        RRDB kernels
-models/checkpoints/  original model checkpoints
-tools/              model conversion, reference architectures and asset embedding
-third_party/stb/     stb image I/O submodule
-third_party/zlib-ng/ statically linked compression library submodule
-```
+Automatic tiling limits GPU memory use. Tiling can change the output where a tile has less image context. Use `--tile 0` for full-frame inference when memory permits. `--tile` and `--halo` override the config.
