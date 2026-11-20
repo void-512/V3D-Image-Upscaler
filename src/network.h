@@ -10,17 +10,14 @@ public:
     virtual ~Network() = default;
     virtual void allocate(int height, int width, int scale) = 0;
     virtual void execute(int scale) = 0;
-    virtual void rescale(int scale) = 0;
 
     BufferPtr input, output;
     int H = 0, W = 0, N = 0;
-    std::string trace;
 
 protected:
     Network(Gpu& gpu, Model model, const char* magic);
     void reserve(BufferPtr& buffer, size_t floats);
     int at(const std::string& name) const;
-    void dump(BufferPtr buffer, const std::string& name, int count);
 
     Gpu& gpu;
     Downscale downscale;

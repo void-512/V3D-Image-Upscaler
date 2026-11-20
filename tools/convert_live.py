@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """Convert the exact RealESRGAN x4plus checkpoint to the dedicated Vulkan format."""
 import argparse
-import hashlib
-import json
-import struct
-import sys
-from pathlib import Path
-
-sys.dont_write_bytecode = True
-ROOT = Path(__file__).resolve().parents[1]
-
-import numpy as np
 import torch
+from package_model import write_model
 from reference.rrdbnet_arch import RRDBNet
 
 
@@ -51,41 +42,12 @@ def convert(checkpoint, destination):
                                 phase[py, px, iy, ix] += value[ky, kx]
                 tensors[name.replace('.weight', '.polyphase')] = phase
         tensors[name] = value
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    entries, arrays, offset = [], [], 0
-    for name, value in tensors.items():
-        arr = value.detach().cpu().float().numpy().reshape(-1).astype('<f4')
-        if offset % 4:
-            padding = 4 - offset % 4
-            arrays.append(np.zeros(padding, dtype='<f4'))
-            offset += padding
-        entries.append((name, offset, arr.size))
-        arrays.append(arr)
-        offset += arr.size
-    with destination.open('wb') as f:
-        f.write(b'RRDBV3D!')
-        f.write(struct.pack('<III', 2, len(entries), offset))
-        for name, start, count in entries:
-            encoded = name.encode()
-            f.write(struct.pack('<III', len(encoded), start, count))
-            f.write(encoded)
-        for arr in arrays:
-            f.write(arr.tobytes())
-    metadata = {'format': 2, 'checkpoint_sha256': hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
-                'model_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
-                'floats': offset, 'tensors': len(entries), 'precision': 'float32',
-                'transforms': ['NHWC convolution weights', '16-byte-aligned tensor starts'] +
-                              ['FP32 F(4x4,3x3) Winograd trunk weights', 'FP32 polyphase 2x upsampling kernels',
-                               'quad-contiguous FP32 192-to-64 Winograd weights'],
-                'checkpoint_key': 'params_ema', 'architecture': 'RRDBNet(3,3,64,23,32,scale=4)'}
-    destination.with_suffix('.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    print(json.dumps(metadata, indent=2))
+    write_model("live", tensors, destination)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', default=str(ROOT / 'models/checkpoints/RealESRGAN_x4plus.pth'))
+    parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     convert(args.checkpoint, args.output)

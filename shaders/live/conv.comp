@@ -36,7 +36,7 @@ float input_at(int row,int k){
 #endif
 }
 void main(){
-#if defined(RGB_FAST) && !defined(POLYPHASE)
+#ifndef POLYPHASE
     if(OC==3 && IC%4==0){
         int r=int(gl_WorkGroupID.y)*192+int(gl_LocalInvocationIndex);
         if(r>=ROWS)return;

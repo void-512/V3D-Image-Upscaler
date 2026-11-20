@@ -60,9 +60,6 @@ void applyDefaults(Task& task, const Config& config)
     const auto& tiling = config.tiling(task.model);
     if (task.tile == -1) task.tile = tiling.tile;
     if (task.halo == -1) task.halo = tiling.halo;
-    if (!task.trace.empty() && task.tile > 0) throw std::invalid_argument("--trace requires --tile 0");
-    if (!task.profile.empty() && !task.trace.empty())
-        throw std::invalid_argument("--profile cannot be combined with --trace");
 }
 }
 
@@ -81,12 +78,6 @@ const char* usage()
   --config FILE   Load performance settings and tasks from a TOML file
   --tile N        Tile core size, multiple of 16; 0 forces full frame
   --halo N        Context halo, multiple of 16 (live: 96, anime: 48)
-  --raw FILE      Save unclipped HWC float32 output for validation
-  --decoded FILE  Save decoded RGB input as PNG for validation
-  --trace DIR     Save intermediate tensors; requires full-frame inference
-  --driver-info   Print the selected Vulkan driver without running inference
-  --reference-graph  Use the validated packed graph before the transform rewrite
-  --profile FILE  Write per-dispatch GPU timestamps and report host timings
   --benchmark     Time inference for both models using the configured tuning
   --warmup M      Benchmark warmup passes per model (default: 1)
   --loop N        Timed benchmark passes per model (default: 3)
@@ -145,26 +136,17 @@ Options parseOptions(int argc, char** argv)
             options.version = true;
             continue;
         }
-        if (arg == "--driver-info") { options.driverInfo = true; continue; }
-        if (arg == "--reference-graph")
-        {
-            task.referenceGraph = true;
-            taskOption = true;
-            continue;
-        }
         if (arg == "--live" || arg == "--anime")
         {
             Model model = arg == "--live" ? Model::Live : Model::Anime;
             if (selected && task.model != model) throw std::invalid_argument("Choose exactly one of --live and --anime per task");
             task.model = model;
-            options.driverModel = model;
             selected = true;
             taskOption = true;
             continue;
         }
         const bool numeric = arg == "--scale" || arg == "--tile" || arg == "--halo";
-        if (!numeric && arg != "-i" && arg != "-o" && arg != "--config" &&
-            arg != "--raw" && arg != "--decoded" && arg != "--trace" && arg != "--profile")
+        if (!numeric && arg != "-i" && arg != "-o" && arg != "--config")
             throw std::invalid_argument("Unknown option: " + arg);
         if (++i >= argc) throw std::invalid_argument("Missing value for " + arg);
         const std::string value = argv[i];
@@ -209,30 +191,18 @@ Options parseOptions(int argc, char** argv)
                 throw std::invalid_argument("Specify one -o OUTPUT after each -i INPUT");
             task.output = value;
         }
-        else if (arg == "--raw")
-            task.raw = value;
-        else if (arg == "--decoded")
-            task.decoded = value;
-        else if (arg == "--trace")
-            task.trace = value;
-        else
-            task.profile = value;
     }
     if (options.help || options.version) return options;
-    if (!options.driverInfo)
+    if (named)
+        appendTask();
+    else if (taskOption || !positional.empty())
     {
-        if (named)
-            appendTask();
-        else if (taskOption || !positional.empty())
-        {
-            if (positional.size() != 2) throw std::invalid_argument("Provide exactly one input and one output path");
-            task.input = std::move(positional[0]);
-            task.output = std::move(positional[1]);
-            appendTask();
-        }
+        if (positional.size() != 2) throw std::invalid_argument("Provide exactly one input and one output path");
+        task.input = std::move(positional[0]);
+        task.output = std::move(positional[1]);
+        appendTask();
     }
     options.config = loadConfig(configFile, &options.tasks);
-    if (options.driverInfo) return options;
     if (options.tasks.empty()) throw std::invalid_argument("Provide a command-line task or add [[tasks]] to the config");
     for (auto& queued : options.tasks)
         applyDefaults(queued, options.config);

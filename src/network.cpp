@@ -1,49 +1,11 @@
 #include "network.h"
-#include "runtime.h"
-
 #include <algorithm>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace upscaler {
-namespace {
-class ModelFile
-{
-public:
-    explicit ModelFile(const std::filesystem::path& path)
-    {
-        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-            throw std::runtime_error("Cannot open model asset " + path.string());
-        struct stat info{};
-        if (fstat(fd, &info) || info.st_size <= 0) {
-            close(fd);
-            throw std::runtime_error("Cannot size model asset " + path.string());
-        }
-        size = static_cast<size_t>(info.st_size);
-        void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED)
-            throw std::runtime_error("Cannot map model asset " + path.string());
-        data = static_cast<const unsigned char*>(map);
-    }
-    ~ModelFile() { munmap(const_cast<unsigned char*>(data), size); }
-    ModelFile(const ModelFile&) = delete;
-    ModelFile& operator=(const ModelFile&) = delete;
-    const unsigned char* data{};
-    size_t size{};
-};
-}
-
 Network::Network(Gpu& device, Model model, const char* magic) : gpu(device), downscale(device)
 {
-    const std::string filename = std::string(modeName(model)) + ".packed.dat";
-    const ModelFile blob(runtimeRoot() / "share/upscaler/models" / filename);
+    const auto blob = embeddedResource(std::string(modeName(model)) + "/model");
     size_t offset = 0;
     auto take = [&](size_t count) {
         if (count > blob.size - offset) throw std::runtime_error("Truncated model asset");
@@ -99,16 +61,6 @@ int Network::at(const std::string& name) const
     return tensors.at(name).first;
 }
 
-void Network::dump(BufferPtr buffer, const std::string& name, int count)
-{
-    if (trace.empty()) return;
-    gpu.finish();
-    std::filesystem::create_directories(trace);
-    std::ofstream file(std::filesystem::path(trace) / (name + ".f32"), std::ios::binary);
-    if (!file.write(static_cast<char*>(buffer->mapped), size_t(count) * 4)) throw std::runtime_error("Cannot write trace");
-    gpu.begin();
-}
-
 int liveStripRows(int h, int w, const Config& config)
 {
     // Fit the tail and its halos in the trunk's dense and transform buffers.
@@ -119,8 +71,7 @@ int liveStripRows(int h, int w, const Config& config)
 
 uint64_t estimatedMemory(Model model, int h, int w, int scale, const Config& config)
 {
-    // 4H * 2W * RGBA32: reserve for the largest Lanczos intermediate, also
-    // when initial 4x inference is followed by additional output scales.
+    // Reserve for up to 4H * 2W RGBA32 Lanczos texels.
     constexpr int outputScratch = 32;
     if (model == Model::Anime)
     {

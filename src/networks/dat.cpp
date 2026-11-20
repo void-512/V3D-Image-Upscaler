@@ -144,7 +144,6 @@ public:
         const int animeAttentionWindows = gpu.config.animeAttentionWindows;
         gpu.begin();
         linear(input, shallow, "conv_first", 3, 180, 3);
-        dump(shallow, "shallow", N * 180);
         layernorm(shallow, x, "before_RG.1");
         for (int g = 0; g < 6; g++)
         {
@@ -210,7 +209,6 @@ public:
                     p[0] = N;
                     gpu.dispatch("channel_av", {channelScores, qkv, attention, weights, {}, {}}, p, 2, (N + 191) / 192, 6);
                 }
-                if (g == 0 && block < 2) dump(attention, "attention" + std::to_string(block), N * 180);
                 poolMean(block % 2 == 0 ? conv : attention);
                 linear(small0, small1, att + ".channel_interaction.1", 180, 22, 1, true, {}, 1);
                 linear(small1, channelMap, att + ".channel_interaction.4", 22, 180, 1, 2, {}, 1);
@@ -228,7 +226,6 @@ public:
                 depthwise(gate, mixed, base + ".ffn.sg.conv", false, 180, 0, wide);
                 linear(mixed, norm, base + ".ffn.fc2", 180, 180, 1, false, x, -1, 0, 0, true);
                 std::swap(x, norm);
-                dump(x, "block" + std::to_string(g * 6 + block), N * 180);
             }
             linear(x, norm, group + ".conv", 180, 180, 3, false, residual);
             std::swap(x, norm);
@@ -237,12 +234,6 @@ public:
         linear(norm, x, "conv_after_body", 180, 180, 3, false, shallow);
         // Keep RGB features outside QKV, which the batched transforms reuse.
         linear(x, norm, "upsample.0", 180, 48, 3);
-        recordOutput(scale);
-        gpu.finish();
-    }
-    void rescale(int scale) override
-    {
-        gpu.begin();
         recordOutput(scale);
         gpu.finish();
     }

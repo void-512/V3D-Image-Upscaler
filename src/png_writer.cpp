@@ -1,101 +1,74 @@
 #include "png_writer.h"
+#include "output_file.h"
 #include "runtime.h"
+#include "stb_image_write.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace upscaler {
 namespace {
-void bigEndian(unsigned char* p, uint32_t value)
+size_t rgbSize(int width, int height)
 {
-    for (int i = 3; i >= 0; --i) { p[i] = value & 255; value >>= 8; }
+    // stb counts filtered bytes and doubles its compression buffer using int.
+    constexpr uint64_t maxFilteredSize = (std::numeric_limits<int>::max() / 2 - 64) * uint64_t(8) / 9;
+    const uint64_t stride = uint64_t(width) * 3;
+    if ((stride + 1) * height > maxFilteredSize)
+        throw std::runtime_error("Output image exceeds the PNG encoder size limit");
+    return stride * height;
 }
 }
-PngWriter::PngWriter(const std::string& path, int w, int h, const std::string& rawPath)
-    : file(path), raw(rawPath), row(size_t(w) * 3 + 1), compressed(65536), cachedRow(size_t(w) * 3), width(w), height(h)
+
+PngWriter::PngWriter(const std::string& path, int w, int h)
+    : path(path), rgb(std::make_unique_for_overwrite<unsigned char[]>(rgbSize(w, h))),
+      cachedRow(size_t(w) * 3), width(w), height(h)
 {
-    if (!file.isOpen()) throw std::runtime_error("Cannot write PNG output");
-    const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
-    if (!file.write(signature, sizeof(signature))) throw std::runtime_error("Cannot write PNG output");
-    unsigned char header[13] = {};
-    bigEndian(header, w); bigEndian(header + 4, h);
-    header[8] = 8; header[9] = 2;
-    chunk("IHDR", header, sizeof(header));
-    if (deflateInit(&stream, 3) != Z_OK) throw std::runtime_error("Cannot initialize PNG compressor");
 }
-PngWriter::~PngWriter()
-{
-    deflateEnd(&stream);
-}
-void PngWriter::chunk(const char* type, const unsigned char* data, size_t size)
-{
-    unsigned char value[4];
-    bigEndian(value, size);
-    if (!file.write(value, sizeof(value)) || !file.write(type, 4) || (size && !file.write(data, size)))
-        throw std::runtime_error("Cannot write PNG output");
-    uLong crc = crc32(0, reinterpret_cast<const unsigned char*>(type), 4);
-    if (size) crc = crc32(crc, data, size);
-    bigEndian(value, crc);
-    if (!file.write(value, sizeof(value))) throw std::runtime_error("Cannot write PNG output");
-}
-void PngWriter::compress(int flush)
-{
-    int status;
-    do
-    {
-        stream.next_out = compressed.data();
-        stream.avail_out = compressed.size();
-        status = deflate(&stream, flush);
-        if (status != Z_OK && status != Z_STREAM_END) throw std::runtime_error("PNG compression failed");
-        const size_t count = compressed.size() - stream.avail_out;
-        if (count) chunk("IDAT", compressed.data(), count);
-    } while (stream.avail_in || !stream.avail_out || (flush == Z_FINISH && status != Z_STREAM_END));
-}
+
 void PngWriter::rows(const float* pixels, int first, int count)
 {
-    if (first != written || first + count > height) throw std::runtime_error("Incorrect output row order");
+    if (first != written || count < 0 || count > height - written)
+        throw std::runtime_error("Incorrect output row order");
+    const size_t stride = cachedRow.size();
+    auto* row = rgb.get() + size_t(first) * stride;
     for (int y = 0; y < count; ++y)
     {
         checkInterrupted();
         // Stage one mapped GPU row in host memory before quantization.
-        const size_t rowBytes = cachedRow.size() * sizeof(float);
-        std::memcpy(cachedRow.data(), pixels, rowBytes);
-        pixels += cachedRow.size();
-        if (raw.isOpen() && !raw.write(cachedRow.data(), rowBytes))
-            throw std::runtime_error("Cannot write raw output");
-        // PNG Sub filter: subtract the preceding pixel's matching channel.
-        row[0] = 1;
-        unsigned char previous[3] = {};
-        for (int x = 0; x < width * 3; ++x)
+        std::memcpy(cachedRow.data(), pixels, stride * sizeof(float));
+        for (size_t x = 0; x < stride; ++x)
         {
             const float value = cachedRow[x];
             if (!std::isfinite(value)) throw std::runtime_error("Non-finite model output");
-            const auto code = static_cast<unsigned char>(std::lround(std::clamp(value, 0.f, 1.f) * 255.f));
-            row[x + 1] = code - previous[x % 3];
-            previous[x % 3] = code;
+            row[x] = static_cast<unsigned char>(std::lround(std::clamp(value, 0.f, 1.f) * 255.f));
         }
-        stream.next_in = row.data();
-        stream.avail_in = row.size();
-        compress(Z_NO_FLUSH);
+        pixels += stride;
+        row += stride;
     }
     written += count;
 }
+
 void PngWriter::finish()
 {
-    if (finished) return;
     if (written != height) throw std::runtime_error("Incomplete PNG output");
     checkInterrupted();
-    stream.next_in = nullptr;
-    stream.avail_in = 0;
-    compress(Z_FINISH);
-    chunk("IEND", nullptr, 0);
-    file.close();
-    raw.close();
+    OutputFile file(path);
+    struct WriteContext { OutputFile& file; bool failed = false; } context{file};
+    const auto write = [](void* user, void* data, int size) {
+        auto& output = *static_cast<WriteContext*>(user);
+        if (!interruptionSignal())
+            output.failed = !output.file.write(data, size);
+    };
+    stbi_write_force_png_filter = 1; // Sub filter, as used by the row encoder.
+    const int encoded = stbi_write_png_to_func(write, &context, width, height, 3, rgb.get(), width * 3);
     checkInterrupted();
-    raw.publish();
+    if (!encoded) throw std::runtime_error("Cannot encode PNG output");
+    if (context.failed) throw std::runtime_error("Cannot write PNG output");
+    file.close();
+    checkInterrupted();
     file.publish();
-    finished = true;
 }
 } // namespace upscaler

@@ -67,15 +67,13 @@ public:
             p[14] = ic == 64 ? 0 : ic - 32;
             p[15] = ic == 64 ? 64 : 32;
             p[21] = ic == 192 && oc == 64;
-            const bool paired = h > 4 && gpu.tuned;
+            const bool paired = h > 4;
             const int inputTiles = paired ? ((h + 7) / 8) * p[13] : p[12];
-            const char* forward = paired ? "conv_win_in_pair" :
-                                  gpu.tuned ? "conv_win_in_tuned" :
-                                  "conv_win_in_half";
+            const char* forward = paired ? "conv_win_in_pair" : "conv_win_in_single";
             gpu.dispatchLinear(forward, {in, {}, winIn, weights, {}, {}}, p, inputTiles * p[15]);
             gpu.dispatch("conv_win_mul_half",
                          {winIn, {}, winOut, weights, {}, halfWeights}, p, (oc + 15) / 16, 3 * ((p[12] + 15) / 16), 1);
-            gpu.dispatchLinear(gpu.tuned ? "conv_win_out_tuned" : "conv_win_out",
+            gpu.dispatchLinear("conv_win_out",
                                {winOut, {}, out, weights, add, mode == 3 ? saved : BufferPtr{}}, p, tiles * oc);
             return;
         }
@@ -108,7 +106,6 @@ public:
         gpu.begin();
         conv(input, shallow, "conv_first", H, W, 3, 64, 3, 64, 0);
         pack(shallow, dense, 0);
-        dump(shallow, "shallow", N * 64);
         for (int block = 0; block < 23; block++)
         {
             // Save the outer residual; growth features occupy disjoint channel slices.
@@ -119,11 +116,6 @@ public:
                 for (int c = 1; c <= 4; c++) conv(dense, dense, base + ".conv" + std::to_string(c), H, W, 64 + (c - 1) * 32, 32, 192, 192, 64 + (c - 1) * 32, 1);
                 // Fold both residual updates into the inverse Winograd transform.
                 conv(dense, dense, base + ".conv5", H, W, 192, 64, 192, 192, 0, rdb == 3 ? 3 : 2, 1, dense);
-            }
-            if (!trace.empty())
-            {
-                pack(dense, x, 1);
-                dump(x, "block" + std::to_string(block), N * 64);
             }
         }
         conv(dense, x, "conv_body", H, W, 64, 64, 192, 64, 0, 0, 1, shallow);
@@ -140,12 +132,6 @@ public:
             conv(hi1, dense, "conv_hr", H * 4, W * 4, 64, 64, 64, 64, 0, 1, 1, {}, hrTop, hrEnd - hrTop, upTop);
             conv(dense, rgb, "conv_last", H * 4, W * 4, 64, 3, 64, 3, 0, 0, 1, {}, top, end - top, hrTop, top);
         }
-        recordOutput(scale);
-        gpu.finish();
-    }
-    void rescale(int scale) override
-    {
-        gpu.begin();
         recordOutput(scale);
         gpu.finish();
     }

@@ -1,51 +1,59 @@
 #include "gpu.h"
 #include "runtime.h"
 #include <algorithm>
-#include <iostream>
 #include <bit>
-#include <cstdlib>
+#include <dlfcn.h>
 
 namespace upscaler {
 void check(VkResult r)
 {
     if (r != VK_SUCCESS) throw std::runtime_error("Vulkan error " + std::to_string(r));
 }
-Gpu::Gpu(Model model, const Config& config, bool performanceQueries, bool uniformAlias)
-    : shaderPrefix(std::string(modeName(model)) + "/"), uniformInputAlias(uniformAlias), config(config)
+namespace {
+PFN_vkGetInstanceProcAddrLUNARG loadDriver()
 {
-    selectPrivateDriver();
+    static const auto library = [] {
+        const auto path = runtimeRoot() / "libvulkan_broadcom.so";
+        void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!handle) throw std::runtime_error(dlerror());
+        return std::unique_ptr<void, int(*)(void*)>(handle, dlclose);
+    }();
+    auto entry = reinterpret_cast<PFN_vkGetInstanceProcAddrLUNARG>(
+        dlsym(library.get(), "vk_icdGetInstanceProcAddr"));
+    if (!entry) throw std::runtime_error("The bundled V3DV driver has no ICD entry point");
+    return entry;
+}
+}
+
+Gpu::Gpu(Model model, const Config& config)
+    : shaderPrefix(std::string(modeName(model)) + "/"), config(config)
+{
+    const char* extension = VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME;
+    VkDirectDriverLoadingInfoLUNARG driver{VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_INFO_LUNARG};
+    driver.pfnGetInstanceProcAddr = loadDriver();
+    VkDirectDriverLoadingListLUNARG drivers{VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG};
+    drivers.mode = VK_DIRECT_DRIVER_LOADING_MODE_EXCLUSIVE_LUNARG;
+    drivers.driverCount = 1;
+    drivers.pDrivers = &driver;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "Pi 5 Upscaler";
+    app.pApplicationName = "Upscaler";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ci.pNext = &drivers;
     ci.pApplicationInfo = &app;
-    const VkResult status = vkCreateInstance(&ci, nullptr, &instance);
-    if (status != VK_SUCCESS)
-        throw std::runtime_error("Could not initialize the private V3DV ICD (Vulkan error " + std::to_string(status) + ")");
+    ci.enabledExtensionCount = 1;
+    ci.ppEnabledExtensionNames = &extension;
+    const auto status = vkCreateInstance(&ci, nullptr, &instance);
+    if (status == VK_ERROR_EXTENSION_NOT_PRESENT)
+        throw std::runtime_error("The Vulkan loader does not support " + std::string(extension));
+    check(status);
     uint32_t count = 0;
     check(vkEnumeratePhysicalDevices(instance, &count, nullptr));
+    if (!count) throw std::runtime_error("The bundled V3DV driver found no Vulkan device");
     std::vector<VkPhysicalDevice> devices(count);
     check(vkEnumeratePhysicalDevices(instance, &count, devices.data()));
-    for (auto d : devices)
-    {
-        VkPhysicalDeviceProperties pr;
-        vkGetPhysicalDeviceProperties(d, &pr);
-        if (pr.vendorID == 0x14e4 && std::string(pr.deviceName).find("V3D") != std::string::npos)
-        {
-            VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-            VkPhysicalDeviceProperties2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-            info.pNext = &driver;
-            vkGetPhysicalDeviceProperties2(d, &info);
-            if (std::string_view(driver.driverInfo).find(privateDriverTag) == std::string_view::npos)
-                continue;
-            physical = d;
-            properties = pr;
-            std::cerr << "Vulkan driver " << driver.driverInfo << '\n';
-            break;
-        }
-    }
-    if (!physical)
-        throw std::runtime_error("The private V3DV ICD did not provide a hardware V3D device");
+    physical = devices.front();
+    vkGetPhysicalDeviceProperties(physical, &properties);
     if (const auto size = uint32_t(config.linearWorkgroupSize);
         size > std::min(properties.limits.maxComputeWorkGroupInvocations, properties.limits.maxComputeWorkGroupSize[0]))
         throw std::runtime_error("performance.linear_workgroup_size exceeds the Vulkan device limit");
@@ -62,7 +70,6 @@ Gpu::Gpu(Model model, const Config& config, bool performanceQueries, bool unifor
     constexpr auto queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT;
     while (family < count && (families[family].queueFlags & queueFlags) != queueFlags) family++;
     if (family == count) throw std::runtime_error("No graphics/compute queue");
-    queueFamily = family;
     float priority = 1;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family;
@@ -73,40 +80,13 @@ Gpu::Gpu(Model model, const Config& config, bool performanceQueries, bool unifor
     VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     features13.pNext = &features12;
-    features12.pNext = &features11;
-    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    features.pNext = &features13;
-    vkGetPhysicalDeviceFeatures2(physical, &features);
-    if (!features13.dynamicRendering || !features.features.fragmentStoresAndAtomics)
-        throw std::runtime_error("Lanczos requires dynamic rendering and fragment storage writes");
-    features13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     features13.dynamicRendering = VK_TRUE;
-    VkPhysicalDeviceFeatures enabled{};
-    enabled.fragmentStoresAndAtomics = VK_TRUE;
-    if (!features12.shaderFloat16 || !features11.storageBuffer16BitAccess ||
-        !features.features.shaderInt16)
-        throw std::runtime_error("Packed inference requires V3D native FP16 arithmetic and 16-bit storage");
-    features12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    features11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    features13.pNext = &features12;
     features12.pNext = &features11;
     features12.shaderFloat16 = VK_TRUE;
     features11.storageBuffer16BitAccess = VK_TRUE;
-    enabled.shaderInt16 = VK_TRUE;
+    VkPhysicalDeviceFeatures enabled{};
+    enabled.fragmentStoresAndAtomics = VK_TRUE;
     di.pNext = &features13;
-    VkPhysicalDevicePerformanceQueryFeaturesKHR perf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR};
-    const char* perfExtension = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
-    if (performanceQueries)
-    {
-        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        supported.pNext = &perf;
-        vkGetPhysicalDeviceFeatures2(physical, &supported);
-        if (!perf.performanceCounterQueryPools) throw std::runtime_error("Performance queries unavailable");
-        perf.performanceCounterMultipleQueryPools = VK_FALSE;
-        features11.pNext = &perf;
-        di.enabledExtensionCount = 1;
-        di.ppEnabledExtensionNames = &perfExtension;
-    }
     di.pEnabledFeatures = &enabled;
     di.queueCreateInfoCount = 1;
     di.pQueueCreateInfos = &qi;
@@ -121,16 +101,16 @@ Gpu::Gpu(Model model, const Config& config, bool performanceQueries, bool unifor
     ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ca.commandBufferCount = 1;
     check(vkAllocateCommandBuffers(device, &ca, &cmd));
-    std::array<VkDescriptorSetLayoutBinding, 9> binds{};
-    for (int i = 0; i < 8 + int(uniformInputAlias); i++)
+    std::array<VkDescriptorSetLayoutBinding, 8> binds{};
+    for (uint32_t i = 0; i < binds.size(); ++i)
     {
         binds[i].binding = i;
-        binds[i].descriptorType = i == 8 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1;
         binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    si.bindingCount = 8 + int(uniformInputAlias);
+    si.bindingCount = binds.size();
     si.pBindings = binds.data();
     check(vkCreateDescriptorSetLayout(device, &si, nullptr, &setLayout));
     VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params)};
@@ -142,7 +122,6 @@ Gpu::Gpu(Model model, const Config& config, bool performanceQueries, bool unifor
     check(vkCreatePipelineLayout(device, &li, nullptr, &layout));
     reserveDispatches(2048);
     dummy = buffer(4);
-    std::cerr << "GPU: " << properties.deviceName << "; compute workgroup limit " << properties.limits.maxComputeWorkGroupInvocations << "\n";
 }
 
 Gpu::~Gpu()
@@ -168,7 +147,6 @@ BufferPtr Gpu::buffer(size_t floats)
     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     ci.size = bytes;
     ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (uniformInputAlias) ci.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     check(vkCreateBuffer(device, &ci, nullptr, &b->buffer));
     VkMemoryRequirements mr;
@@ -245,8 +223,6 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
     VkSpecializationInfo spec{uint32_t(entries.size()), entries.data(), sizeof(constants), constants.data()};
     if (!entries.empty()) ci.stage.pSpecializationInfo = &spec;
     VkPipeline result;
-    if (std::getenv("UPSCALER_TRACE_PIPELINES"))
-        std::cerr << "Upscaler pipeline " << shaderPrefix << name << '\n';
     VkResult status = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &result);
     vkDestroyShaderModule(device, module, nullptr);
     check(status);
@@ -262,21 +238,19 @@ void Gpu::reserveDispatches(uint32_t count)
     if (descriptors) vkDestroyDescriptorPool(device, descriptors, nullptr);
     descriptors = VK_NULL_HANDLE;
     dispatchCapacity = std::bit_ceil(count);
-    VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 * dispatchCapacity}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, dispatchCapacity}};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 * dispatchCapacity};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = dispatchCapacity;
-    dp.poolSizeCount = 1 + int(uniformInputAlias);
-    dp.pPoolSizes = ps;
+    dp.poolSizeCount = 1;
+    dp.pPoolSizes = &ps;
     check(vkCreateDescriptorPool(device, &dp, nullptr, &descriptors));
 }
 
 void Gpu::begin()
 {
     checkInterrupted();
-    if (observeBatch) recordingStart = std::chrono::steady_clock::now();
     check(vkResetCommandPool(device, pool, 0));
     check(vkResetDescriptorPool(device, descriptors, 0));
-    descriptorSetsUsed = 0;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cmd, &bi));
@@ -289,7 +263,6 @@ void Gpu::begin()
 void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t x, uint32_t y, uint32_t z)
 {
     checkInterrupted();
-    if (descriptorSetsUsed >= dispatchCapacity) throw std::runtime_error("Too many dispatches");
     if (x > properties.limits.maxComputeWorkGroupCount[0] || y > properties.limits.maxComputeWorkGroupCount[1] || z > properties.limits.maxComputeWorkGroupCount[2]) throw std::runtime_error("Dispatch exceeds V3D limits; use --tile");
     VkPipeline pipe = pipeline(name, p);
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -298,22 +271,21 @@ void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, co
     ai.pSetLayouts = &setLayout;
     VkDescriptorSet ds;
     check(vkAllocateDescriptorSets(device, &ai, &ds));
-    std::array<VkDescriptorBufferInfo, 9> info;
-    std::array<VkWriteDescriptorSet, 9> writes{};
-    for (int i = 0; i < 8 + int(uniformInputAlias); i++)
+    std::array<VkDescriptorBufferInfo, 8> info;
+    std::array<VkWriteDescriptorSet, 8> writes{};
+    for (uint32_t i = 0; i < writes.size(); ++i)
     {
-        int src = i < 6 ? i : i == 6 || i == 8 ? 0
-                                     : 3;
+        const auto src = i < buffers.size() ? i : i == 6 ? 0 : 3;
         BufferPtr b = buffers[src] ? buffers[src] : dummy;
         info[i] = {b->buffer, 0, b->bytes};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = ds;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
-        writes[i].descriptorType = i == 8 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &info[i];
     }
-    vkUpdateDescriptorSets(device, 8 + int(uniformInputAlias), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device, writes.size(), writes.data(), 0, nullptr);
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -321,10 +293,7 @@ void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, co
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, nullptr);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Params), p.data());
-    if (observeDispatch) observeDispatch(name, p, true);
     vkCmdDispatch(cmd, x, y, z);
-    ++descriptorSetsUsed;
-    if (observeDispatch) observeDispatch(name, p, false);
 }
 
 void Gpu::dispatchLinear(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t elements)
@@ -346,17 +315,10 @@ void Gpu::finish()
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    const auto submit = observeBatch ? std::chrono::steady_clock::now() : recordingStart;
     checkInterrupted();
     check(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
-    // Buffer and query-pool owners may unwind as soon as cancellation is observed.
+    // Buffer owners may unwind as soon as cancellation is observed.
     check(vkQueueWaitIdle(queue));
     checkInterrupted();
-    if (observeBatch)
-    {
-        using Milliseconds = std::chrono::duration<double, std::milli>;
-        observeBatch(Milliseconds(submit - recordingStart).count(),
-                     Milliseconds(std::chrono::steady_clock::now() - submit).count());
-    }
 }
 } // namespace upscaler

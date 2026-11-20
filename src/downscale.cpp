@@ -156,7 +156,7 @@ void Downscale::record(BufferPtr source, BufferPtr output, int height, int width
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buffers[0], nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &texture, nullptr, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[1], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buffers[1], nullptr}};
-    // record() is called once per completed inference/rescale submission.
+    // Each inference records its own output pass.
     vkUpdateDescriptorSets(gpu.device, 3, writes, 0, nullptr);
     VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;

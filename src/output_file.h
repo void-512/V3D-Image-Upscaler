@@ -16,7 +16,6 @@ public:
     OutputFile(const OutputFile&) = delete;
     OutputFile& operator=(const OutputFile&) = delete;
 
-    bool isOpen() const { return file != nullptr; }
     bool write(const void* data, size_t size);
     void close();
     void publish();

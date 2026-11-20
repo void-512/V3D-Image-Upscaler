@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """Convert the exact APISR DAT-Small checkpoint to the dedicated Vulkan format."""
 import argparse
-import hashlib
-import json
-import struct
-import sys
-from pathlib import Path
-
-sys.dont_write_bytecode = True
-ROOT = Path(__file__).resolve().parents[1]
-
-import numpy as np
 import torch
+from package_model import write_model
 from reference.dat import DAT, Spatial_Attention
 
 
@@ -77,41 +68,12 @@ def convert(checkpoint, destination):
             pos = module.pos(module.rpe_biases)
             bias = pos[module.relative_position_index.flatten()].reshape(128, 128, 3)
             tensors[name + '.relative_bias'] = bias.permute(2, 0, 1).contiguous()
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    entries, arrays, offset = [], [], 0
-    for name, value in tensors.items():
-        arr = value.detach().cpu().float().numpy().reshape(-1).astype('<f4')
-        if offset % 4:
-            padding = 4 - offset % 4
-            arrays.append(np.zeros(padding, dtype='<f4'))
-            offset += padding
-        entries.append((name, offset, arr.size))
-        arrays.append(arr)
-        offset += arr.size
-    with destination.open('wb') as f:
-        f.write(b'APISRDAT')
-        f.write(struct.pack('<III', 2, len(entries), offset))
-        for name, start, count in entries:
-            encoded = name.encode()
-            f.write(struct.pack('<III', len(encoded), start, count))
-            f.write(encoded)
-        for arr in arrays:
-            f.write(arr.tobytes())
-    metadata = {'format': 2, 'checkpoint_sha256': hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
-                'model_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(),
-                'floats': offset, 'tensors': len(entries), 'precision': 'float32',
-                'transforms': ['evaluation BatchNorm folding', 'constant relative-position bias evaluation',
-                               'NHWC convolution and transposed linear weights',
-                               '16-byte-aligned tensor starts', 'FP32 F(4x4,3x3) Winograd convolutions',
-                               'quad-contiguous FP32 projection/FFN and Winograd weights']}
-    destination.with_suffix('.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    print(json.dumps(metadata, indent=2))
+    write_model("anime", tensors, destination)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', default=str(ROOT / 'models/checkpoints/4x_APISR_DAT_GAN_generator.pth'))
+    parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     convert(args.checkpoint, args.output)

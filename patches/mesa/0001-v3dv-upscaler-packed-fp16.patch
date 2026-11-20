@@ -1,0 +1,319 @@
+diff --git a/src/broadcom/compiler/nir_to_vir.c b/src/broadcom/compiler/nir_to_vir.c
+--- a/src/broadcom/compiler/nir_to_vir.c
++++ b/src/broadcom/compiler/nir_to_vir.c
+@@ -3667,6 +3667,19 @@
+ ntq_emit_intrinsic(struct v3d_compile *c, nir_intrinsic_instr *instr)
+ {
+         switch (instr->intrinsic) {
++        case nir_intrinsic_fadd2x16_v3d:
++        case nir_intrinsic_fmul2x16_v3d: {
++                struct qreg a = ntq_get_src(c, instr->src[0], 0);
++                struct qreg b = ntq_get_src(c, instr->src[1], 0);
++                const bool mul = instr->intrinsic == nir_intrinsic_fmul2x16_v3d;
++                struct qreg result = mul ? vir_VFMUL(c, a, b) : vir_VFADD(c, a, b);
++                if (mul)
++                        vir_set_unpack(c->defs[result.index], 0,
++                                       nir_intrinsic_component(instr));
++                ntq_store_def(c, &instr->def, 0, result);
++                break;
++        }
++
+         case nir_intrinsic_decl_reg:
+         case nir_intrinsic_load_reg:
+         case nir_intrinsic_store_reg:
+diff --git a/src/broadcom/vulkan/v3dv_pipeline.c b/src/broadcom/vulkan/v3dv_pipeline.c
+--- a/src/broadcom/vulkan/v3dv_pipeline.c
++++ b/src/broadcom/vulkan/v3dv_pipeline.c
+@@ -295,6 +295,58 @@
+                                        nir_metadata_control_flow, NULL);
+ }
+ 
++/* Fuse explicitly packed vector FP16 math before lowering the bitcasts. */
++static nir_scalar
++packed_fp16_src(nir_scalar value, unsigned src)
++{
++   return nir_scalar_chase_movs(nir_scalar_chase_alu_src(value, src));
++}
++
++static bool
++lower_packed_fp16(nir_builder *b, nir_alu_instr *pack, void *data)
++{
++   if (pack->op != nir_op_pack_32_2x16)
++      return false;
++
++   nir_alu_src *src = &pack->src[0];
++   nir_scalar lo = nir_scalar_resolved(src->src.ssa, src->swizzle[0]);
++   nir_scalar hi = nir_scalar_resolved(src->src.ssa, src->swizzle[1]);
++   if (lo.def != hi.def || lo.comp != 0 || hi.comp != 1 ||
++       !nir_scalar_is_alu(lo))
++      return false;
++
++   nir_op op = nir_scalar_alu_op(lo);
++   if (op != nir_op_fmul && op != nir_op_fadd)
++      return false;
++
++   nir_scalar words[2];
++   enum v3d_qpu_input_unpack unpack = V3D_QPU_UNPACK_NONE;
++   for (unsigned i = 0; i < ARRAY_SIZE(words); i++) {
++      nir_scalar a = packed_fp16_src(lo, i);
++      nir_scalar b = packed_fp16_src(hi, i);
++      if (!nir_scalar_is_alu(a) || nir_scalar_alu_op(a) != nir_op_unpack_32_2x16 ||
++          !nir_scalar_is_alu(b) || nir_scalar_alu_op(b) != nir_op_unpack_32_2x16)
++         return false;
++
++      words[i] = packed_fp16_src(a, 0);
++      if (!nir_scalar_equal(words[i], packed_fp16_src(b, 0)))
++         return false;
++
++      if (op == nir_op_fmul && i == 0 && a.comp == b.comp)
++         unpack = a.comp ? V3D_QPU_UNPACK_REPLICATE_H_16 : V3D_QPU_UNPACK_REPLICATE_L_16;
++      else if (a.comp != 0 || b.comp != 1)
++         return false;
++   }
++
++   b->cursor = nir_before_instr(&pack->instr);
++   nir_def *a = nir_channel(b, words[0].def, words[0].comp);
++   nir_def *c = nir_channel(b, words[1].def, words[1].comp);
++   nir_def *result = op == nir_op_fadd ? nir_fadd2x16_v3d(b, a, c) :
++                     nir_fmul2x16_v3d(b, a, c, .component = unpack);
++   nir_def_rewrite_uses(&pack->def, result);
++   return true;
++}
++
+ static void
+ preprocess_nir(nir_shader *nir)
+ {
+@@ -419,6 +471,10 @@
+                 stage->program_id);
+       nir_log_shaderi(nir);
+    }
++
++   if (device->devinfo.ver >= 71 && gl_stage == MESA_SHADER_COMPUTE)
++      NIR_PASS(_, nir, nir_shader_alu_pass, lower_packed_fp16,
++               nir_metadata_control_flow, NULL);
+ 
+    preprocess_nir(nir);
+ 
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -856,6 +856,8 @@
+    case nir_intrinsic_load_texture_scale:
+    case nir_intrinsic_load_inline_data_intel:
+    case nir_intrinsic_load_push_data_intel:
++   case nir_intrinsic_fadd2x16_v3d:
++   case nir_intrinsic_fmul2x16_v3d:
+    case nir_intrinsic_resource_intel: {
+       unsigned num_srcs = nir_intrinsic_infos[instr->intrinsic].num_srcs;
+       for (unsigned i = 0; i < num_srcs; i++) {
+diff --git a/src/compiler/nir/nir_intrinsics.py b/src/compiler/nir/nir_intrinsics.py
+--- a/src/compiler/nir/nir_intrinsics.py
++++ b/src/compiler/nir/nir_intrinsics.py
+@@ -2400,6 +2400,12 @@
+ # BASE = sample index
+ store("tlb_sample_color_v3d", [1], [BASE, COMPONENT, SRC_TYPE], [])
+ 
++# Componentwise FP16 arithmetic on a pair of halfwords in a uint32.
++intrinsic("fadd2x16_v3d", src_comp=[1, 1], dest_comp=1, bit_sizes=[32],
++          flags=[CAN_ELIMINATE, CAN_REORDER])
++intrinsic("fmul2x16_v3d", src_comp=[1, 1], dest_comp=1, bit_sizes=[32],
++          indices=[COMPONENT], flags=[CAN_ELIMINATE, CAN_REORDER])
++
+ # V3D-specific intrinsic to load the number of layers attached to
+ # the target framebuffer
+ intrinsic("load_fb_layers_v3d", dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER])
+diff --git a/src/broadcom/cle/meson.build b/src/broadcom/cle/meson.build
+--- a/src/broadcom/cle/meson.build
++++ b/src/broadcom/cle/meson.build
+@@ -28,9 +28,9 @@
+ 
+ v3d_xml_h = custom_target(
+   'v3d_xml.h',
+-  input : ['../../util/gen_zipped_xml_file.py', v3d_xml_files],
++  input : v3d_xml_files,
+   output : 'v3d_xml.h',
+-  command : [prog_python, '@INPUT@'],
++  command : [prog_python, files('../../util/gen_zipped_xml_file.py'), '--uncompressed', '@INPUT@'],
+   capture : true,
+ )
+ 
+@@ -45,6 +45,6 @@
+   include_directories : [inc_include, inc_src, inc_broadcom],
+   c_args : [no_override_init_args, expat_args],
+   gnu_symbol_visibility : 'hidden',
+-  dependencies : [dep_libdrm, dep_valgrind, dep_expat, dep_zlib],
++  dependencies : [dep_libdrm, dep_valgrind, dep_expat],
+   build_by_default : false,
+ )
+diff --git a/src/broadcom/cle/v3d_decoder.c b/src/broadcom/cle/v3d_decoder.c
+--- a/src/broadcom/cle/v3d_decoder.c
++++ b/src/broadcom/cle/v3d_decoder.c
+@@ -34,7 +34,6 @@
+ #include <expat.h>
+ #endif
+ #include <inttypes.h>
+-#include <zlib.h>
+ 
+ #include <util/log.h>
+ #include <util/macros.h>
+@@ -576,54 +575,6 @@
+ {
+ }
+ 
+-static uint32_t zlib_inflate(const void *compressed_data,
+-                             uint32_t compressed_len,
+-                             void **out_ptr)
+-{
+-        struct z_stream_s zstream;
+-        void *out;
+-
+-        memset(&zstream, 0, sizeof(zstream));
+-
+-        zstream.next_in = (unsigned char *)compressed_data;
+-        zstream.avail_in = compressed_len;
+-
+-        if (inflateInit(&zstream) != Z_OK)
+-                return 0;
+-
+-        out = malloc(4096);
+-        zstream.next_out = out;
+-        zstream.avail_out = 4096;
+-
+-        do {
+-                switch (inflate(&zstream, Z_SYNC_FLUSH)) {
+-                case Z_STREAM_END:
+-                        goto end;
+-                case Z_OK:
+-                        break;
+-                default:
+-                        inflateEnd(&zstream);
+-                        return 0;
+-                }
+-
+-                if (zstream.avail_out)
+-                        break;
+-
+-                out = realloc(out, 2*zstream.total_out);
+-                if (out == NULL) {
+-                        inflateEnd(&zstream);
+-                        return 0;
+-                }
+-
+-                zstream.next_out = (unsigned char *)out + zstream.total_out;
+-                zstream.avail_out = zstream.total_out;
+-        } while (1);
+- end:
+-        inflateEnd(&zstream);
+-        *out_ptr = out;
+-        return zstream.total_out;
+-}
+-
+ #endif /* WITH_LIBEXPAT */
+ 
+ struct v3d_spec *
+@@ -638,10 +589,7 @@
+ 
+ #ifdef WITH_LIBEXPAT
+         struct parser_context ctx;
+-        void *buf;
+-        uint8_t *text_data = NULL;
+         uint32_t text_offset = 0, text_length = 0;
+-        ASSERTED uint32_t total_length;
+ 
+         for (int i = 0; i < ARRAY_SIZE(genxml_files_table); i++) {
+                 if (i != 0) {
+@@ -676,29 +624,20 @@
+ 
+         ctx.spec = spec;
+ 
+-        total_length = zlib_inflate(compress_genxmls,
+-                                    sizeof(compress_genxmls),
+-                                    (void **) &text_data);
+-        assert(text_offset + text_length <= total_length);
+-        assert(text_data);
+-
+-        buf = XML_GetBuffer(ctx.parser, text_length);
+-        memcpy(buf, &text_data[text_offset], text_length);
+-
+-        if (XML_ParseBuffer(ctx.parser, text_length, true) == 0) {
++        assert(text_offset + text_length <= sizeof(raw_genxmls));
++        if (XML_Parse(ctx.parser, (const char *)raw_genxmls + text_offset,
++                      text_length, true) == XML_STATUS_ERROR) {
+                 mesa_loge("Error parsing XML at line %ld col %ld byte %ld/%u: %s",
+                           XML_GetCurrentLineNumber(ctx.parser),
+                           XML_GetCurrentColumnNumber(ctx.parser),
+                           XML_GetCurrentByteIndex(ctx.parser), text_length,
+                           XML_ErrorString(XML_GetErrorCode(ctx.parser)));
+                 XML_ParserFree(ctx.parser);
+-                free(text_data);
+                 free(spec);
+                 return NULL;
+         }
+ 
+         XML_ParserFree(ctx.parser);
+-        free(text_data);
+ 
+         return ctx.spec;
+ #else /* !WITH_LIBEXPAT */
+diff --git a/src/util/gen_zipped_xml_file.py b/src/util/gen_zipped_xml_file.py
+--- a/src/util/gen_zipped_xml_file.py
++++ b/src/util/gen_zipped_xml_file.py
+@@ -4,16 +4,19 @@
+ # SPDX-License-Identifier: MIT
+ 
+ import sys
+-import zlib
+ import xml.etree.ElementTree as et
+ 
+ 
+ def main():
+-    if len(sys.argv) < 2:
++    uncompressed = sys.argv[1:2] == ["--uncompressed"]
++    filenames = sys.argv[2:] if uncompressed else sys.argv[1:]
++    if not filenames:
+         print("No input xml file specified")
+         sys.exit(1)
+ 
+-    compress = zlib.compressobj()
++    if not uncompressed:
++        import zlib
++        compress = zlib.compressobj()
+ 
+     print("static const struct {")
+     print("   uint32_t ver_10;")
+@@ -22,9 +25,8 @@
+     print("} genxml_files_table[] = {")
+ 
+     xml_offset = 0
+-    compressed_data = b''
+-    for i in range(1, len(sys.argv)):
+-        filename = sys.argv[i]
++    payload = b''
++    for filename in filenames:
+         xml = open(filename, "rb").read()
+         xml_length = len(xml)
+         root = et.fromstring(xml)
+@@ -32,17 +34,19 @@
+         print("   { %i, %i, %i }," %
+               (int(float(root.attrib['gen']) * 10), xml_offset, xml_length))
+ 
+-        compressed_data += compress.compress(xml)
++        payload += xml if uncompressed else compress.compress(xml)
+         xml_offset += xml_length
+ 
+     print("};")
+ 
+-    compressed_data += compress.flush()
++    if not uncompressed:
++        payload += compress.flush()
+ 
+     print("")
+-    print("static const uint8_t compress_genxmls[] = {")
++    name = "raw_genxmls" if uncompressed else "compress_genxmls"
++    print(f"static const uint8_t {name}[] = {{")
+     print("   ", end='')
+-    for i, c in enumerate(bytearray(compressed_data), start=1):
++    for i, c in enumerate(payload, start=1):
+         print("0x%.2x, " % c, end='\n   ' if not i % 12 else '')
+     print('\n};')
+ 

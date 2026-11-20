@@ -4,11 +4,9 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #include "common.glsl"
 layout(local_size_x=16,local_size_y=12) in;
-#ifdef NARROW
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(set=0,binding=2,std430) writeonly buffer HalfOutput {float16_t halfOut[];};
-#endif
 void main(){
     int row=int(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*12+int(gl_LocalInvocationID.y);
     if(row>=p[11]*384)return;
@@ -19,10 +17,6 @@ void main(){
     mx=subgroupMax(mx);float z=0.0;
     for(int i=0;i<8;i++){v[i]=exp(v[i]-mx);z+=v[i];}
     z=subgroupAdd(z);
-#ifdef NARROW
     int dst=(row/4)*512+row%4;
     for(int i=0;i<8;i++)halfOut[dst+(i*16+lane)*4]=float16_t(v[i]/z);
-#else
-    for(int i=0;i<8;i++)o[row*128+i*16+lane]=v[i]/z;
-#endif
 }

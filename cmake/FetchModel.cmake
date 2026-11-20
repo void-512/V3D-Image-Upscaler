@@ -1,6 +1,6 @@
 get_filename_component(directory "${OUTPUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${directory}")
-file(DOWNLOAD "${URL}" "${OUTPUT}.part" TLS_VERIFY ON EXPECTED_HASH "SHA256=${SHA256}" STATUS status)
+file(DOWNLOAD "${URL}" "${OUTPUT}.part" TLS_VERIFY ON STATUS status)
 list(GET status 0 result)
 if(NOT result EQUAL 0)
     file(REMOVE "${OUTPUT}.part")

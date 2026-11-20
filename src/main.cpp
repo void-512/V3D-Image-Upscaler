@@ -1,12 +1,12 @@
 #include "options.h"
-#include "dispatch_profile.h"
+#include "output_file.h"
 #include "runtime.h"
 #include "upscale.h"
 #include "png_writer.h"
 #include "stb_image.h"
-#include "stb_image_write.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -28,30 +28,22 @@ bool confirmPaths(const std::vector<Task>& tasks)
 
     std::set<fs::path> destinations;
     std::vector<std::string> existing;
-    const auto inspect = [&](const std::string& name, bool directory = false) {
-        if (name.empty()) return;
+    for (const auto& task : tasks)
+    {
         checkInterrupted();
+        const auto& name = task.output;
         const auto status = fs::status(name);
-        if (fs::exists(status) && fs::is_directory(status) != directory)
-            throw std::runtime_error("Invalid output path: " + name);
+        if (fs::is_directory(status))
+            throw std::runtime_error("Output path is a directory: " + name);
         // Pipes and devices are streamed to without replacing the file itself.
-        if (!directory && fs::exists(status) && !fs::is_regular_file(status)) return;
+        if (fs::exists(status) && !fs::is_regular_file(status)) continue;
         const auto target = fs::absolute(resolveOutputPath(name));
-        if (!directory && !fs::is_directory(target.parent_path()))
+        if (!fs::is_directory(target.parent_path()))
             throw std::runtime_error("Output directory does not exist: " + target.parent_path().string());
         if (!destinations.insert(fs::weakly_canonical(target)).second)
             throw std::runtime_error("Multiple outputs target the same path: " + name);
-        if (directory ? fs::exists(status) && !fs::is_empty(name)
-                      : fs::exists(status) || fs::is_symlink(fs::symlink_status(name)))
+        if (fs::exists(status) || fs::is_symlink(fs::symlink_status(name)))
             existing.push_back(name);
-    };
-    for (const auto& task : tasks)
-    {
-        inspect(task.output);
-        inspect(task.raw);
-        inspect(task.decoded);
-        inspect(task.profile);
-        inspect(task.trace, true);
     }
     if (existing.empty()) return true;
 
@@ -63,19 +55,6 @@ bool confirmPaths(const std::vector<Task>& tasks)
     std::getline(std::cin, answer);
     checkInterrupted();
     return answer == "y" || answer == "Y";
-}
-
-void saveDecoded(const std::string& path, const unsigned char* pixels, int width, int height)
-{
-    OutputFile output(path);
-    const auto write = [](void* context, void* data, int size) {
-        static_cast<OutputFile*>(context)->write(data, size);
-    };
-    if (!stbi_write_png_to_func(write, &output, width, height, 3, pixels, width * 3))
-        throw std::runtime_error("Cannot save decoded input");
-    output.close();
-    checkInterrupted();
-    output.publish();
 }
 
 int resolveTile(const Task& task, const Config& config, int width, int height)
@@ -115,7 +94,6 @@ void runBenchmark(const Options& options)
         task.halo = config.tiling(model).halo;
         task.tile = resolveTile(task, config, size, size);
         Gpu gpu(model, config);
-        gpu.tuned = true;
         auto network = model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
         if (!task.tile)
         {
@@ -123,7 +101,7 @@ void runBenchmark(const Options& options)
             upload(*network, model, pixels.data(), size, 0, 0);
         }
         const auto infer = [&] {
-            upscale(*network, pixels.data(), size, size, task, {});
+            upscale(*network, pixels.data(), size, size, task);
         };
         for (int i = 0; i < options.warmup; ++i)
             infer();
@@ -147,54 +125,33 @@ void runBenchmark(const Options& options)
 
 void runTask(Task task, const Config& config)
 {
-    using Clock = std::chrono::steady_clock;
-    using Milliseconds = std::chrono::duration<double, std::milli>;
     checkInterrupted();
-    RunTimings host;
-    const auto decodeStart = Clock::now();
-    int width, height, channels;
-    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load(task.input.c_str(), &width, &height, &channels, 3), stbi_image_free);
+    int width, height;
+    std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
+        stbi_load(task.input.c_str(), &width, &height, nullptr, 3), stbi_image_free);
     checkInterrupted();
     if (!pixels) throw std::runtime_error(std::string("Cannot decode input: ") + stbi_failure_reason());
-    if (width <= 0 || height <= 0 || int64_t(width) * height > INT32_MAX / 48) throw std::runtime_error("Image dimensions too large");
-    if (!task.decoded.empty()) saveDecoded(task.decoded, pixels.get(), width, height);
-    host.decode = Milliseconds(Clock::now() - decodeStart).count();
+    if (width <= 0 || height <= 0 || int64_t(width) * height > INT32_MAX / 48)
+        throw std::runtime_error("Image dimensions too large");
     task.tile = resolveTile(task, config, width, height);
-    if (task.tile && !task.trace.empty()) throw std::runtime_error("--trace requires --tile 0");
-    if (task.tile) std::cerr << "Tiling: core=" << task.tile << ", halo=" << task.halo << ". Cropped-context output can differ from full-frame inference.\n";
-    const auto driverStart = Clock::now();
-    Gpu gpu(task.model, config);
-    checkInterrupted();
-    host.driver = Milliseconds(Clock::now() - driverStart).count();
-    gpu.tuned = !task.referenceGraph;
-    DispatchProfile timings(gpu, task.profile);
-    const auto modelStart = Clock::now();
-    auto network = task.model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
-    checkInterrupted();
-    host.model = Milliseconds(Clock::now() - modelStart).count();
-    network->trace = task.trace;
-    if (!task.tile)
+    if (task.tile)
+        std::cerr << "Tiling: core=" << task.tile << ", halo=" << task.halo
+                  << ". Cropped-context output can differ from full-frame inference.\n";
+
+    PngWriter writer(task.output, width * task.scale, height * task.scale);
     {
-        const auto allocateStart = Clock::now();
-        network->allocate(height, width, task.scale);
-        const auto uploadStart = Clock::now();
-        upload(*network, task.model, pixels.get(), width, 0, 0);
-        host.allocate = Milliseconds(uploadStart - allocateStart).count();
-        host.upload = Milliseconds(Clock::now() - uploadStart).count();
+        Gpu gpu(task.model, config);
+        auto network = task.model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
+        if (!task.tile)
+        {
+            network->allocate(height, width, task.scale);
+            upload(*network, task.model, pixels.get(), width, 0, 0);
+        }
+        upscale(*network, pixels.get(), width, height, task,
+                [&](const float* data, int first, int rows) { writer.rows(data, first, rows); });
     }
-    PngWriter writer(task.output, width * task.scale, height * task.scale, task.raw);
-    upscale(*network, pixels.get(), width, height, task,
-            {{task.scale, [&](const float* data, int first, int rows) {
-                const auto encodeStart = Clock::now();
-                writer.rows(data, first, rows);
-                host.encode += Milliseconds(Clock::now() - encodeStart).count();
-            }}}, task.profile.empty() ? nullptr : &host);
-    const auto finishStart = Clock::now();
+    pixels.reset();
     writer.finish();
-    host.encode += Milliseconds(Clock::now() - finishStart).count();
-    if (!task.profile.empty())
-        std::cerr << "Profile host," << host.decode << ',' << host.driver << ',' << host.model << ','
-                  << host.allocate << ',' << host.upload << ',' << host.blend << ',' << host.encode << '\n';
 }
 
 int run(int argc, char** argv)
@@ -214,11 +171,6 @@ int run(int argc, char** argv)
     if (options.version)
     {
         std::cout << "upscaler " << UPSCALER_VERSION << '\n';
-        return 0;
-    }
-    if (options.driverInfo)
-    {
-        Gpu gpu(options.driverModel, options.config);
         return 0;
     }
     if (!confirmPaths(options.tasks))

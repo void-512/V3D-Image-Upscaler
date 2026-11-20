@@ -2,9 +2,7 @@
 #include "config.h"
 #include <vulkan/vulkan.h>
 #include <array>
-#include <chrono>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -33,7 +31,7 @@ using Params = std::array<int, 24>;
 class Gpu
 {
 public:
-    uint32_t dispatchCapacity = 0, descriptorSetsUsed = 0;
+    uint32_t dispatchCapacity = 0;
     VkInstance instance{};
     VkPhysicalDevice physical{};
     VkDevice device{};
@@ -48,15 +46,9 @@ public:
     std::map<std::string, VkPipeline> pipelines;
     BufferPtr dummy;
     std::string shaderPrefix;
-    uint32_t queueFamily = 0;
-    bool uniformInputAlias = false;
-    bool tuned = false;
     const Config config;
-    // Optional benchmark instrumentation; empty in normal inference.
-    std::function<void(const std::string&, const Params&, bool)> observeDispatch;
-    std::function<void(double, double)> observeBatch;
 
-    explicit Gpu(Model model, const Config& config = {}, bool performanceQueries = false, bool uniformAlias = false);
+    Gpu(Model model, const Config& config);
 
     ~Gpu();
 
@@ -73,8 +65,6 @@ public:
 
     void finish();
 
-private:
-    std::chrono::steady_clock::time_point recordingStart;
 };
 
 } // namespace upscaler

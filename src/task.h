@@ -8,8 +8,7 @@ struct Task
 {
     Model model = Model::Live;
     int scale = 4, tile = -1, halo = -1;
-    bool referenceGraph = false;
-    std::string input, output, raw, decoded, trace, profile;
+    std::string input, output;
 };
 
 constexpr bool validScale(int scale)

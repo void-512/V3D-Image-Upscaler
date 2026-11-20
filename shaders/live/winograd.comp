@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
-#ifdef TUNED
+#ifndef ANIME
 #extension GL_EXT_control_flow_attributes : require
 #endif
 #if OP == 1
@@ -47,10 +47,10 @@ layout(constant_id=21) const int WPACKED=0;
 #define WINSTRIDE 192
 #endif
 
-#if defined(NARROW) && OP == 1
+#if !defined(ANIME) && OP == 1
 #define PACKED_PRODUCT_FP32
 #include "packed_gemm.glsl"
-#elif defined(NARROW) && OP == 0
+#elif !defined(ANIME) && OP == 0
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(set=0,binding=2,std430) writeonly buffer HalfOutput {float16_t halfOut[];};
@@ -93,11 +93,7 @@ void storeTile(float rows[36],int tile,int c){
         transform6(column,vertical);
         [[unroll]] for(int y=0;y<6;y++){
             int dst=(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4;
-#ifdef NARROW
             halfOut[dst]=float16_t(vertical[y]);
-#else
-            o[dst]=vertical[y];
-#endif
         }
     }
 }
@@ -134,7 +130,7 @@ void main(){
 #endif
     int yy=imageTile/TW*4-1,xx=imageTile%TW*4-1;
     float v[36];
-#ifdef TUNED
+#ifndef ANIME
     int column[6], row[6];
     bool validColumn[6], validRow[6];
     [[unroll]] for(int slot=0;slot<6;slot++){
@@ -148,7 +144,7 @@ void main(){
 #endif
     for(int y=0;y<6;y++) {
         float r[6];
-#ifdef TUNED
+#ifndef ANIME
         [[unroll]] for(int x=0;x<6;x++){
             float z=a[row[y]+column[x]];
             r[x]=validRow[y]&&validColumn[x]?z:0.;
@@ -163,7 +159,7 @@ void main(){
         v[y*6+4]=2.*r[1]-r[2]-2.*r[3]+r[4];
         v[y*6+5]=4.*r[1]-5.*r[3]+r[5];
     }
-#ifdef TUNED
+#ifndef ANIME
     [[unroll]]
 #endif
     for(int x=0;x<6;x++) {
@@ -177,7 +173,7 @@ void main(){
         q[5]=4.*r[1]-5.*r[3]+r[5];
         for(int y=0;y<6;y++){
             int dst=(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4;
-#ifdef NARROW
+#ifndef ANIME
             halfOut[dst]=float16_t(q[y]);
 #else
             o[dst]=q[y];
@@ -194,7 +190,7 @@ void main(){
     uint phase=(mi+ni)&3u;
     uint ai=(plane*uint(T/4)+min((row>>2)+mi,uint(T/4-1)))*uint(WINSTRIDE)+phase;
     uint cq=min((col>>2)+ni,uint(OC/4-1));
-#ifdef NARROW
+#ifndef ANIME
     uint weightOffset=uint(p[22])/4u;
 #else
     uint weightOffset=uint(p[5])/4u;
@@ -202,7 +198,7 @@ void main(){
     uint bi=weightOffset+(WPACKED!=0?(plane*uint(OC/4)+cq)*uint(IC)+phase:(plane*uint(IC)+phase)*uint(OC/4)+cq);
     uint bs=WPACKED!=0?4u:uint(OC);
     uint ar=mi*4u+((ni+1u)&3u),br=((mi+1u)&3u)*4u+ni;
-#ifdef NARROW
+#ifndef ANIME
     vec4 s0,s1,s2,s3;
     packed_gemm(ai,bi,bs,ar,br,s0,s1,s2,s3);
 #else
@@ -248,7 +244,7 @@ void main(){
     }
     vec4 result[4]=vec4[4](r[0]+r[1]+r[2]+r[3]+r[4],r[1]-r[2]+2.*(r[3]-r[4]),r[1]+r[2]+4.*(r[3]+r[4]),r[1]-r[2]+8.*(r[3]-r[4])+r[5]);
     for(int y=0;y<4;y++)for(int x=0;x<4;x++)if(
-#ifdef TUNED
+#ifndef ANIME
         (H%4==0&&W%4==0)||
 #endif
         (yy+y<H&&xx+x<W)){

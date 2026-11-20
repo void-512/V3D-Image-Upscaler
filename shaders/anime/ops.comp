@@ -3,11 +3,7 @@
 #include "common.glsl"
 layout(local_size_x=64) in;
 #if OP == 4
-#ifdef NARROW
 layout(set=0,binding=2,std430) buffer PackedOut {uvec2 o4[];};
-#else
-layout(set=0,binding=2,std430) buffer PackedOut {vec4 o4[];};
-#endif
 #endif
 void main() {
     int lane=int(gl_LocalInvocationID.x);
@@ -38,11 +34,7 @@ void main() {
     // Gate sigmoid is already computed once in the producing linear layer.
     float cg=d[c];
     vec4 value=p[1]==0?av*cg+bv*sg:av*sg+bv*cg;
-#ifdef NARROW
     o4[i]=uvec2(packHalf2x16(value.xy),packHalf2x16(value.zw));
-#else
-    o4[i]=value;
-#endif
 #elif OP == 6
     // Q/K squared norms, partial sums. QKV is pixel-major, 540 channels.
     int c=i%360,chunk=i/360;

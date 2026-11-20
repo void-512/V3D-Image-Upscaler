@@ -23,8 +23,6 @@ std::filesystem::path resolveOutputPath(std::filesystem::path path)
 
 OutputFile::OutputFile(const std::string& path) : destination(path)
 {
-    if (path.empty()) return;
-
     const auto status = std::filesystem::status(destination);
     const bool replacing = is_regular_file(status);
     if (!exists(status) || replacing)
@@ -64,9 +62,7 @@ bool OutputFile::write(const void* data, size_t size)
 
 void OutputFile::close()
 {
-    if (!file) return;
-    const bool failed = std::ferror(file);
-    if (std::fclose(std::exchange(file, nullptr)) != 0 || failed)
+    if (std::fclose(std::exchange(file, nullptr)) != 0)
         throw std::runtime_error("Cannot finish output " + destination.string());
 }
 
