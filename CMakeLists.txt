@@ -18,7 +18,7 @@ find_path(UPSCALER_STB_INCLUDE stb_image_write.h
 find_path(TOML_INCLUDE toml++/toml.hpp
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlplusplus/include" REQUIRED)
 
-set(UPSCALER_MESA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mesa" CACHE PATH "Clean Mesa source tree or Git checkout")
+set(UPSCALER_MESA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mesa" CACHE PATH "Clean Mesa source tree or Git checkout")
 set(UPSCALER_MESA_JOBS 2 CACHE STRING "Parallel jobs for the Mesa build")
 set(UPSCALER_MODELS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/checkpoints" CACHE PATH "Local model checkpoints or packed weights")
 

@@ -18,12 +18,12 @@ upscaler INPUT.png --anime OUTPUT.png
 - Python with Mako and packaging.
 - Development libraries for libdrm, libudev, Expat, and Zstandard.
 
-The project uses a customized mesa that packs 2 fp16 data into a single fp32 datapath to achieve 2x fp16 performance. So it will need its own vulkan driver.
+The Mesa submodule pins version 26.2.7 under `third_party/mesa`. The build applies the V3DV patch to a temporary copy to pack two FP16 values into one FP32 datapath. Set `UPSCALER_MESA_SOURCE` to use another clean Mesa source tree.
 
 The build looks for local checkpoints in `models/checkpoints/` and downloads missing ones. Install the [Python conversion dependencies](tools/requirements.txt) to build from checkpoints. Set `UPSCALER_MODELS_DIR` to use checkpoints or prepacked weights from another directory.
 
 ```sh
-git submodule update --init --recursive
+git submodule update --init --recursive --depth 1
 cmake -S . -B build -G Ninja
 cmake --build build
 ```
