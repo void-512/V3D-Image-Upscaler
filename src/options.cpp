@@ -1,6 +1,7 @@
 #include "options.h"
 #include <charconv>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -13,6 +14,45 @@ int parseInteger(const std::string& arg, const std::string& value)
     if (result.ec != std::errc() || result.ptr != value.data() + value.size())
         throw std::invalid_argument("Invalid integer for " + arg + ": " + value);
     return number;
+}
+
+bool benchmarkRequested(int argc, char** argv)
+{
+    for (int i = 1; i < argc && std::string_view(argv[i]) != "--"; ++i)
+        if (std::string_view(argv[i]) == "--benchmark") return true;
+    return false;
+}
+
+Options parseBenchmark(int argc, char** argv)
+{
+    Options options;
+    options.benchmark = true;
+    std::filesystem::path configFile;
+    for (int i = 1; i < argc && std::string_view(argv[i]) != "--"; ++i)
+    {
+        const std::string arg = argv[i];
+        if (arg != "--config" && arg != "--warmup" && arg != "--loop") continue;
+        if (++i >= argc || std::string_view(argv[i]) == "--")
+            throw std::invalid_argument("Missing value for " + arg);
+        const std::string value = argv[i];
+        if (arg == "--config")
+        {
+            if (value.empty()) throw std::invalid_argument("--config requires a file path");
+            configFile = value;
+        }
+        else if (arg == "--warmup")
+        {
+            options.warmup = parseInteger(arg, value);
+            if (options.warmup < 0) throw std::invalid_argument("--warmup must be nonnegative");
+        }
+        else
+        {
+            options.loops = parseInteger(arg, value);
+            if (options.loops < 1) throw std::invalid_argument("--loop must be positive");
+        }
+    }
+    options.config = loadConfig(configFile);
+    return options;
 }
 
 void applyDefaults(Task& task, const Config& config)
@@ -30,6 +70,7 @@ const char* usage()
 {
     return R"(Usage: upscaler INPUT (--live | --anime) [options] OUTPUT.png
        upscaler -i INPUT (--live | --anime) [options] -o OUTPUT.png [-i INPUT ...]
+       upscaler --benchmark [--warmup M] [--loop N] [--config FILE]
        upscaler [--config FILE]
 
   -i INPUT        Start a command-line task
@@ -46,6 +87,9 @@ const char* usage()
   --driver-info   Print the selected Vulkan driver without running inference
   --reference-graph  Use the validated packed graph before the transform rewrite
   --profile FILE  Write per-dispatch GPU timestamps and report host timings
+  --benchmark     Time inference for both models using the configured tuning
+  --warmup M      Benchmark warmup passes per model (default: 1)
+  --loop N        Timed benchmark passes per model (default: 3)
   --help          Show this help
   --version       Show the version
 
@@ -56,11 +100,14 @@ Examples:
 Models are loaded from the runtime's share/upscaler/models directory.
 Without --config, config.toml is searched in the working directory, then the runtime root.
 Command-line tasks run before [[tasks]] entries. Each task produces an RGB PNG.
+Benchmark mode uses a built-in image and reads only --warmup, --loop and --config.
 )";
 }
 
 Options parseOptions(int argc, char** argv)
 {
+    if (benchmarkRequested(argc, argv)) return parseBenchmark(argc, argv);
+
     Options options;
     Task task;
     bool selected = false, positionalOnly = false, named = false, taskOption = false;
@@ -184,7 +231,7 @@ Options parseOptions(int argc, char** argv)
             appendTask();
         }
     }
-    options.config = loadConfig(configFile, options.tasks);
+    options.config = loadConfig(configFile, &options.tasks);
     if (options.driverInfo) return options;
     if (options.tasks.empty()) throw std::invalid_argument("Provide a command-line task or add [[tasks]] to the config");
     for (auto& queued : options.tasks)

@@ -6,7 +6,10 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 
+#include <algorithm>
+#include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <set>
 
 using namespace upscaler;
@@ -75,6 +78,73 @@ void saveDecoded(const std::string& path, const unsigned char* pixels, int width
     output.publish();
 }
 
+int resolveTile(const Task& task, const Config& config, int width, int height)
+{
+    if (task.tile != -1) return task.tile;
+    const bool largeAttention = task.model == Model::Anime && uint64_t((height + 15) / 16 * 16) * ((width + 15) / 16 * 16) * 384 * 4 > uint64_t(1) * 1024 * 1024 * 1024;
+    const auto memoryLimit = uint64_t(config.tileMemoryThresholdMiB) * 1024 * 1024;
+    const bool tile = estimatedMemory(task.model, height, width, task.scale, config) > memoryLimit || largeAttention;
+    return tile ? config.tiling(task.model).tileSize : 0;
+}
+
+void runBenchmark(const Options& options)
+{
+    using Clock = std::chrono::steady_clock;
+    using Milliseconds = std::chrono::duration<double, std::milli>;
+    constexpr int size = 96, scale = 4;
+    std::vector<unsigned char> pixels(size * size * 3);
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x)
+        {
+            auto* rgb = pixels.data() + (y * size + x) * 3;
+            rgb[0] = x * 255 / (size - 1);
+            rgb[1] = y * 255 / (size - 1);
+            rgb[2] = (3 * x + 5 * y) % 256;
+        }
+
+    const auto& config = options.config;
+    std::cout << "Benchmark " << size << 'x' << size << " RGB at " << scale << "x, warmup=" << options.warmup
+              << ", loops=" << options.loops << ", workgroup=" << config.linearWorkgroupSize << std::endl;
+    for (const auto model : {Model::Anime, Model::Live})
+    {
+        checkInterrupted();
+        Task task;
+        task.model = model;
+        task.scale = scale;
+        task.tile = config.tiling(model).tile;
+        task.halo = config.tiling(model).halo;
+        task.tile = resolveTile(task, config, size, size);
+        Gpu gpu(model, config);
+        gpu.tuned = true;
+        auto network = model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
+        if (!task.tile)
+        {
+            network->allocate(size, size, scale);
+            upload(*network, model, pixels.data(), size, 0, 0);
+        }
+        const auto infer = [&] {
+            upscale(*network, pixels.data(), size, size, task, {});
+        };
+        for (int i = 0; i < options.warmup; ++i)
+            infer();
+
+        std::vector<double> samples;
+        for (int i = 0; i < options.loops; ++i)
+        {
+            const auto start = Clock::now();
+            infer();
+            samples.push_back(Milliseconds(Clock::now() - start).count());
+        }
+        std::sort(samples.begin(), samples.end());
+        const double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+        const double median = (samples[(samples.size() - 1) / 2] + samples[samples.size() / 2]) / 2;
+        std::cout << modeName(model) << " (tile=" << task.tile << ", halo=" << task.halo << ")"
+                  << std::fixed << std::setprecision(2) << " min=" << samples.front()
+                  << " ms, median=" << median << " ms, mean=" << mean
+                  << " ms, max=" << samples.back() << " ms" << std::endl;
+    }
+}
+
 void runTask(Task task, const Config& config)
 {
     using Clock = std::chrono::steady_clock;
@@ -89,13 +159,7 @@ void runTask(Task task, const Config& config)
     if (width <= 0 || height <= 0 || int64_t(width) * height > INT32_MAX / 48) throw std::runtime_error("Image dimensions too large");
     if (!task.decoded.empty()) saveDecoded(task.decoded, pixels.get(), width, height);
     host.decode = Milliseconds(Clock::now() - decodeStart).count();
-    if (task.tile == -1)
-    {
-        const bool largeAttention = task.model == Model::Anime && uint64_t((height + 15) / 16 * 16) * ((width + 15) / 16 * 16) * 384 * 4 > uint64_t(1) * 1024 * 1024 * 1024;
-        const auto memoryLimit = uint64_t(config.tileMemoryThresholdMiB) * 1024 * 1024;
-        const bool tile = estimatedMemory(task.model, height, width, task.scale, config) > memoryLimit || largeAttention;
-        task.tile = tile ? config.tiling(task.model).tileSize : 0;
-    }
+    task.tile = resolveTile(task, config, width, height);
     if (task.tile && !task.trace.empty()) throw std::runtime_error("--trace requires --tile 0");
     if (task.tile) std::cerr << "Tiling: core=" << task.tile << ", halo=" << task.halo << ". Cropped-context output can differ from full-frame inference.\n";
     const auto driverStart = Clock::now();
@@ -137,6 +201,11 @@ int run(int argc, char** argv)
 {
     const Options options = parseOptions(argc, argv);
     checkInterrupted();
+    if (options.benchmark)
+    {
+        runBenchmark(options);
+        return 0;
+    }
     if (options.help)
     {
         std::cout << usage();

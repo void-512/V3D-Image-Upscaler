@@ -135,8 +135,9 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
                 }
                 if (timings) timings->blend += Milliseconds(Clock::now() - blendStart).count();
             }
-            std::cerr << "Tile " << ty * (xs.size() - 1) + tx + 1 << '/' << (ys.size() - 1) * (xs.size() - 1)
-                      << " at " << left << ',' << top << " (" << network.W << 'x' << network.H << ")\n";
+            if (!sinks.empty())
+                std::cerr << "Tile " << ty * (xs.size() - 1) + tx + 1 << '/' << (ys.size() - 1) * (xs.size() - 1)
+                          << " at " << left << ',' << top << " (" << network.W << 'x' << network.H << ")\n";
         }
         const int safe = bottom == height ? height : std::max(bottom - blend, 0);
         const auto flushStart = Clock::now();

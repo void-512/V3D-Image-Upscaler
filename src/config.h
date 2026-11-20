@@ -26,5 +26,6 @@ struct Config
 };
 
 inline constexpr int maxTileDimension = 1048576;
-Config loadConfig(const std::filesystem::path& requested, std::vector<Task>& tasks);
+// A caller that only needs inference tuning can omit the task list.
+Config loadConfig(const std::filesystem::path& requested, std::vector<Task>* tasks = nullptr);
 } // namespace upscaler

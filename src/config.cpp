@@ -66,7 +66,7 @@ void appendTasks(const toml::node& node, const std::filesystem::path& directory,
 }
 }
 
-Config loadConfig(const std::filesystem::path& requested, std::vector<Task>& tasks)
+Config loadConfig(const std::filesystem::path& requested, std::vector<Task>* tasks)
 {
     Config config;
     auto file = requested;
@@ -86,11 +86,14 @@ Config loadConfig(const std::filesystem::path& requested, std::vector<Task>& tas
         {
             if (section == "tasks")
             {
-                appendTasks(node, file.parent_path(), tasks);
+                if (tasks) appendTasks(node, file.parent_path(), *tasks);
                 continue;
             }
             if (section != "performance" && section != "anime" && section != "live")
-                throw std::invalid_argument("Unknown section " + std::string(section.str()));
+            {
+                if (tasks) throw std::invalid_argument("Unknown section " + std::string(section.str()));
+                continue;
+            }
             const auto* table = node.as_table();
             if (!table)
                 throw std::invalid_argument(std::string(section.str()) + " must be a table");
@@ -115,7 +118,7 @@ Config loadConfig(const std::filesystem::path& requested, std::vector<Task>& tas
                     tiling.tileSize = integer(value, key, 16, maxTileDimension, 16);
                 else if (section != "performance" && name == "halo")
                     tiling.halo = integer(value, key, 16, maxTileDimension, 16);
-                else
+                else if (tasks)
                     throw std::invalid_argument("Unknown setting " + key);
             }
         }
