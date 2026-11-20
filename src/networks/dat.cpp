@@ -41,12 +41,16 @@ public:
         reserve(spatialMap, N);
         reserve(channelScores, 5400);
         reserve(norms, 360);
+        if (gpu.optimized)
+            reserve(halfProbabilities, std::min(windows, size_t(animeAttentionWindows)) * 24576);
         reserve(output, size_t(N) * scale * scale * 3);
     }
+    BufferPtr halfProbabilities;
     void op(int kind, BufferPtr a, BufferPtr b, BufferPtr out, Params p, int groups, BufferPtr aux = {}, BufferPtr extra = {})
     {
         int gx = std::min(groups, 65535), gy = (groups + gx - 1) / gx;
-        gpu.dispatch("op" + std::to_string(kind), {a, b, out, weights, aux, extra}, p, gx, gy, 1);
+        gpu.dispatch(kind == 4 && gpu.optimized ? "op4_half" : "op" + std::to_string(kind),
+                     {a, b, out, weights, aux, extra}, p, gx, gy, 1);
     }
     void linear(BufferPtr in, BufferPtr out, const std::string& name, int ic, int oc, int kernel = 1, int activation = 0, BufferPtr add = {}, int count = -1, int stride = 0, int offset = 0, bool packed = false)
     {
@@ -82,7 +86,11 @@ public:
             }
             return;
         }
-        p[5] = at(name + ".weight");
+        const bool narrow = gpu.optimized && packed;
+        if (narrow)
+            p[22] = packedTensors.at(name + ".weight").first;
+        else
+            p[5] = at(name + ".weight");
         p[6] = at(name + ".bias");
         p[7] = activation;
         p[8] = stride ? stride : ic;
@@ -91,8 +99,9 @@ public:
         p[11] = packed;
         p[12] = modelVersion >= 2 && packed && ic == 180 && (oc == 180 || oc == 360);
         int tile = 192;
-        gpu.dispatch("gemm_fast",
-                     {in, {}, out, weights, add, {}}, p, (oc + 15) / 16, (p[0] * p[1] + tile - 1) / tile, 1);
+        gpu.dispatch(narrow ? "gemm_fast_half" : "gemm_fast",
+                     {in, {}, out, weights, add, narrow ? halfWeights : BufferPtr{}},
+                     p, (oc + 15) / 16, (p[0] * p[1] + tile - 1) / tile, 1);
     }
     void layernorm(BufferPtr in, BufferPtr out, const std::string& name, int stride = 180, int offset = 0, bool packed = false)
     {
@@ -104,7 +113,8 @@ public:
         p[4] = at(name + ".weight");
         p[5] = at(name + ".bias");
         p[6] = packed;
-        gpu.dispatch("norm", {in, {}, out, weights, {}, {}}, p, (N + 11) / 12, 1, 1);
+        gpu.dispatch(packed && gpu.optimized ? "norm_half" : "norm",
+                     {in, {}, out, weights, {}, {}}, p, (N + 11) / 12, 1, 1);
     }
     void depthwise(BufferPtr in, BufferPtr out, const std::string& name, bool activation, int stride, int offset, BufferPtr multiply = {})
     {
@@ -120,7 +130,8 @@ public:
         p[8] = bool(multiply);
         p[9] = bool(multiply);
         int groups = (N * 45 + 191) / 192, gx = std::min(groups, 65535);
-        gpu.dispatch("depthwise", {in, multiply, out, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
+        gpu.dispatch(multiply && gpu.optimized ? "depthwise_half" : "depthwise",
+                     {in, multiply, out, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
     }
     void poolMean(BufferPtr in)
     {
@@ -177,8 +188,11 @@ public:
                                 p[10] = first;
                                 p[11] = std::min(animeAttentionWindows, windows - first);
                                 gpu.dispatch("window_qk", {qkv, {}, partial, weights, {}, {}}, p, 8, 2, p[11]);
-                                gpu.dispatch("softmax", {partial, {}, partial, weights, {}, {}}, p, p[11] * 32, 1, 1);
-                                gpu.dispatch("window_av", {qkv, partial, attention, weights, {}, {}}, p, 2, 2, p[11]);
+                                const auto probabilities = gpu.optimized ? halfProbabilities : partial;
+                                gpu.dispatch(gpu.optimized ? "softmax_half" : "softmax",
+                                             {partial, {}, probabilities, weights, {}, {}}, p, p[11] * 32, 1, 1);
+                                gpu.dispatch(gpu.optimized ? "window_av_half" : "window_av",
+                                             {qkv, probabilities, attention, weights, {}, {}}, p, 2, 2, p[11]);
                             }
                         }
                     }

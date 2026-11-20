@@ -28,8 +28,9 @@ protected:
     Gpu& gpu;
     uint32_t modelVersion = 0;
     Downscale downscale;
-    BufferPtr weights;
+    BufferPtr weights, halfWeights;
     std::map<std::string, std::pair<int, int> > tensors;
+    std::map<std::string, std::pair<int, int> > packedTensors;
 };
 
 int liveStripRows(int height, int width);

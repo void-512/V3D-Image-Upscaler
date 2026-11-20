@@ -56,8 +56,11 @@ struct Band
 };
 }
 
-void upscale(Network& network, const unsigned char* pixels, int width, int height, const Options& options, const std::vector<ScaleSink>& sinks)
+void upscale(Network& network, const unsigned char* pixels, int width, int height, const Options& options,
+             const std::vector<ScaleSink>& sinks, RunTimings* timings)
 {
+    using Clock = std::chrono::steady_clock;
+    using Milliseconds = std::chrono::duration<double, std::milli>;
     if (!options.tile)
     {
         network.execute(options.scale);
@@ -80,14 +83,23 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
         const int top = ys[ty], bottom = ys[ty + 1];
         const int y0 = std::max(top - halo, 0), y1 = std::min(bottom + halo, height);
         const int ky0 = std::max(top - blend, 0), ky1 = std::min(bottom + blend, height);
+        const auto extendStart = Clock::now();
         for (auto& band : bands) band.extend(ky1 * band.sink.scale);
+        if (timings) timings->blend += Milliseconds(Clock::now() - extendStart).count();
         for (size_t tx = 0; tx + 1 < xs.size(); ++tx)
         {
             const int left = xs[tx], right = xs[tx + 1];
             const int x0 = std::max(left - halo, 0), x1 = std::min(right + halo, width);
             const int kx0 = std::max(left - blend, 0), kx1 = std::min(right + blend, width);
+            const auto allocateStart = Clock::now();
             network.allocate(y1 - y0, x1 - x0, options.scale);
+            const auto uploadStart = Clock::now();
             upload(network, options.model, pixels, width, x0, y0);
+            if (timings)
+            {
+                timings->allocate += Milliseconds(uploadStart - allocateStart).count();
+                timings->upload += Milliseconds(Clock::now() - uploadStart).count();
+            }
             network.execute(options.scale);
             int current = options.scale;
             for (auto& band : bands)
@@ -95,6 +107,7 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
                 const int scale = band.sink.scale;
                 if (scale != current) network.rescale(scale);
                 current = scale;
+                const auto blendStart = Clock::now();
                 const auto* src = static_cast<const float*>(network.output->mapped);
                 for (int y = ky0 * scale; y < ky1 * scale; ++y)
                     for (int x = kx0 * scale; x < kx1 * scale; ++x)
@@ -108,12 +121,17 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
                         band.weights[dst] += weight;
                         for (int c = 0; c < 3; ++c) band.values[dst * 3 + c] += src[source * 3 + c] * weight;
                     }
+                if (timings) timings->blend += Milliseconds(Clock::now() - blendStart).count();
             }
             std::cerr << "Tile " << ty * (xs.size() - 1) + tx + 1 << '/' << (ys.size() - 1) * (xs.size() - 1)
                       << " at " << left << ',' << top << " (" << network.W << 'x' << network.H << ")\n";
         }
         const int safe = bottom == height ? height : std::max(bottom - blend, 0);
+        const auto flushStart = Clock::now();
+        const double encodeBefore = timings ? timings->encode : 0;
         for (auto& band : bands) band.flush(safe * band.sink.scale);
+        if (timings) timings->blend += Milliseconds(Clock::now() - flushStart).count()
+                                      - (timings->encode - encodeBefore);
     }
 }
 } // namespace upscaler

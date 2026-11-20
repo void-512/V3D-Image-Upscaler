@@ -1,21 +1,27 @@
 #include "gpu.h"
+#include "runtime.h"
 #include <algorithm>
 #include <iostream>
 #include <bit>
+#include <cstdlib>
 
 namespace upscaler {
 void check(VkResult r)
 {
     if (r != VK_SUCCESS) throw std::runtime_error("Vulkan error " + std::to_string(r));
 }
-Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias) : shaderPrefix(std::string(modeName(model)) + "/"), uniformInputAlias(uniformAlias)
+Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias, bool usePacked, bool requirePrivate)
+    : shaderPrefix(std::string(modeName(model)) + "/"), uniformInputAlias(uniformAlias), optimized(usePacked)
 {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "Pi 5 Upscaler";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
-    check(vkCreateInstance(&ci, nullptr, &instance));
+    const VkResult status = vkCreateInstance(&ci, nullptr, &instance);
+    if (status != VK_SUCCESS && requirePrivate)
+        throw std::runtime_error("Could not initialize the private V3DV ICD (Vulkan error " + std::to_string(status) + ")");
+    check(status);
     uint32_t count = 0;
     check(vkEnumeratePhysicalDevices(instance, &count, nullptr));
     std::vector<VkPhysicalDevice> devices(count);
@@ -26,12 +32,21 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias) : shaderPrefix
         vkGetPhysicalDeviceProperties(d, &pr);
         if (pr.vendorID == 0x14e4 && std::string(pr.deviceName).find("V3D") != std::string::npos)
         {
+            VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            info.pNext = &driver;
+            vkGetPhysicalDeviceProperties2(d, &info);
+            if (requirePrivate && std::string_view(driver.driverInfo).find(privateDriverTag) == std::string_view::npos)
+                continue;
             physical = d;
             properties = pr;
+            std::cerr << "Vulkan driver " << driver.driverInfo << '\n';
             break;
         }
     }
-    if (!physical) throw std::runtime_error("A hardware V3D Vulkan device is required; no CPU fallback is permitted");
+    if (!physical)
+        throw std::runtime_error(requirePrivate ? "The private V3DV ICD did not provide a hardware V3D device" :
+                                 "A hardware V3D Vulkan device is required");
     VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 pr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     pr2.pNext = &sg;
@@ -53,6 +68,10 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias) : shaderPrefix
     qi.pQueuePriorities = &priority;
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    features13.pNext = &features12;
+    features12.pNext = &features11;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &features13;
     vkGetPhysicalDeviceFeatures2(physical, &features);
@@ -62,6 +81,18 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias) : shaderPrefix
     features13.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceFeatures enabled{};
     enabled.fragmentStoresAndAtomics = VK_TRUE;
+    if (optimized && (!features12.shaderFloat16 || !features11.storageBuffer16BitAccess ||
+                      !features.features.shaderInt16))
+        throw std::runtime_error("Packed inference requires V3D native FP16 arithmetic and 16-bit storage");
+    features12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    features11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    if (optimized) {
+        features13.pNext = &features12;
+        features12.pNext = &features11;
+        features12.shaderFloat16 = VK_TRUE;
+        features11.storageBuffer16BitAccess = VK_TRUE;
+        enabled.shaderInt16 = VK_TRUE;
+    }
     di.pNext = &features13;
     VkPhysicalDevicePerformanceQueryFeaturesKHR perf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR};
     const char* perfExtension = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
@@ -72,7 +103,10 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias) : shaderPrefix
         vkGetPhysicalDeviceFeatures2(physical, &supported);
         if (!perf.performanceCounterQueryPools) throw std::runtime_error("Performance queries unavailable");
         perf.performanceCounterMultipleQueryPools = VK_FALSE;
-        features13.pNext = &perf;
+        if (optimized)
+            features11.pNext = &perf;
+        else
+            features13.pNext = &perf;
         di.enabledExtensionCount = 1;
         di.ppEnabledExtensionNames = &perfExtension;
     }
@@ -164,7 +198,7 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
         key += "_" + std::to_string(p[3]);
         entries.push_back({3, 12, 4});
     }
-    if (name == "gemm_fast")
+    if (name == "gemm_fast" || name == "gemm_fast_half")
         for (int i : {0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12})
         {
             key += "_" + std::to_string(p[i]);
@@ -176,7 +210,7 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
             key += "_" + std::to_string(p[i]);
             entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
         }
-    if (name == "depthwise")
+    if (name == "depthwise" || name == "depthwise_half")
         for (int i : {0, 1, 3, 4, 7, 8, 9})
         {
             key += "_" + std::to_string(p[i]);
@@ -205,6 +239,8 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
     VkSpecializationInfo spec{uint32_t(entries.size()), entries.data(), sizeof(Params), p.data()};
     if (!entries.empty()) ci.stage.pSpecializationInfo = &spec;
     VkPipeline result;
+    if (std::getenv("UPSCALER_TRACE_PIPELINES"))
+        std::cerr << "Upscaler pipeline " << shaderPrefix << name << '\n';
     VkResult status = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &result);
     vkDestroyShaderModule(device, module, nullptr);
     check(status);
@@ -230,6 +266,7 @@ void Gpu::reserveDispatches(uint32_t count)
 
 void Gpu::begin()
 {
+    if (observeBatch) recordingStart = std::chrono::steady_clock::now();
     check(vkResetCommandPool(device, pool, 0));
     check(vkResetDescriptorPool(device, descriptors, 0));
     descriptorSetsUsed = 0;
@@ -292,7 +329,14 @@ void Gpu::finish()
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
+    const auto submit = observeBatch ? std::chrono::steady_clock::now() : recordingStart;
     check(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
     check(vkQueueWaitIdle(queue));
+    if (observeBatch)
+    {
+        using Milliseconds = std::chrono::duration<double, std::milli>;
+        observeBatch(Milliseconds(submit - recordingStart).count(),
+                     Milliseconds(std::chrono::steady_clock::now() - submit).count());
+    }
 }
 } // namespace upscaler

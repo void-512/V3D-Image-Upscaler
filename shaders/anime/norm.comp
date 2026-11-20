@@ -4,8 +4,40 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #include "common.glsl"
 layout(local_size_x=16,local_size_y=12) in;
+#ifdef NARROW
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(set=0,binding=2,std430) writeonly buffer HalfOutput {float16_t halfOut[];};
+#endif
 void main(){
     int row=int(gl_WorkGroupID.x)*12+int(gl_LocalInvocationID.y);
+#ifdef NARROW
+    if(row>=p[0])return;
+    int lane=int(gl_SubgroupInvocationID);
+    float cache[12];
+    float sum=0.0;
+    [[unroll]] for(int k=0;k<12;k++){
+        int c=k*16+lane;
+        cache[k]=c<180?a[row*p[2]+p[3]+c]:0.0;
+        sum+=cache[k];
+    }
+    float mean=subgroupAdd(sum)/180.0;
+    float variance=0.0;
+    [[unroll]] for(int k=0;k<12;k++){
+        int c=k*16+lane;
+        float v=cache[k]-mean;
+        if(c<180)variance+=v*v;
+    }
+    float inv=inversesqrt(subgroupAdd(variance)/180.0+1e-5);
+    [[unroll]] for(int k=0;k<12;k++){
+        int c=k*16+lane;
+        if(c<180){
+            int dst=((row/4)*180+c)*4+row%4;
+            halfOut[dst]=float16_t((cache[k]-mean)*inv*w[p[4]+c]+w[p[5]+c]);
+        }
+    }
+#else
     if(row<p[0]){
         int lane=int(gl_SubgroupInvocationID);
         float sum=0.0;
@@ -16,4 +48,5 @@ void main(){
         float inv=inversesqrt(subgroupAdd(variance)/180.0+1e-5);
         for(int c=lane;c<180;c+=16){int dst=p[6]!=0?((row/4)*180+c)*4+row%4:row*180+c;o[dst]=(a[row*p[2]+p[3]+c]-mean)*inv*w[p[4]+c]+w[p[5]+c];}
     }
+#endif
 }

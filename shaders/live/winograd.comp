@@ -1,6 +1,10 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#ifdef TUNED
+#extension GL_EXT_control_flow_attributes : require
+#endif
 layout(local_size_x=16,local_size_y=12) in;
 layout(set=0,binding=0,std430) readonly buffer Input {float a[];};
 #if OP == 1
@@ -35,8 +39,83 @@ layout(constant_id=21) const int WPACKED=0;
 #define WINSTRIDE 192
 #endif
 
+#if defined(NARROW) && OP == 1
+#define PACKED_PRODUCT_FP32
+#include "packed_gemm.glsl"
+#elif defined(NARROW) && OP == 0
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(set=0,binding=2,std430) writeonly buffer HalfOutput {float16_t halfOut[];};
+#endif
+
+#if OP == 0 && defined(REGISTER_PAIR)
+void transform6(float v[6], out float y[6]){
+    y[0]=4.*v[0]-5.*v[2]+v[4];
+    y[1]=-4.*v[1]-4.*v[2]+v[3]+v[4];
+    y[2]=4.*v[1]-4.*v[2]-v[3]+v[4];
+    y[3]=-2.*v[1]-v[2]+2.*v[3]+v[4];
+    y[4]=2.*v[1]-v[2]-2.*v[3]+v[4];
+    y[5]=4.*v[1]-5.*v[3]+v[5];
+}
+
+void loadRows(int y0,int c,int x0,int first,inout float rows[36]){
+    int columns[6];
+    bool valid[6];
+    [[unroll]] for(int x=0;x<6;x++){
+        int px=x0+x;
+        columns[x]=clamp(px,0,W-1)*STRIDE+c;
+        valid[x]=px>=0&&px<W;
+    }
+    [[unroll]] for(int y=first;y<6;y++){
+        int py=y0+y, offset=clamp(py,0,H-1)*W*STRIDE;
+        float raw[6], horizontal[6];
+        [[unroll]] for(int x=0;x<6;x++){
+            float value=a[offset+columns[x]];
+            raw[x]=py>=0&&py<H&&valid[x]?value:0.;
+        }
+        transform6(raw,horizontal);
+        [[unroll]] for(int x=0;x<6;x++)rows[y*6+x]=horizontal[x];
+    }
+}
+
+void storeTile(float rows[36],int tile,int c){
+    [[unroll]] for(int x=0;x<6;x++){
+        float column[6], vertical[6];
+        [[unroll]] for(int y=0;y<6;y++)column[y]=rows[y*6+x];
+        transform6(column,vertical);
+        [[unroll]] for(int y=0;y<6;y++){
+            int dst=(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4;
+#ifdef NARROW
+            halfOut[dst]=float16_t(vertical[y]);
+#else
+            o[dst]=vertical[y];
+#endif
+        }
+    }
+}
+
+void transformTilePair(){
+    int n=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
+    int tilesY=(H+3)/4;
+    if(n>=((tilesY+1)/2)*TW*COUNT)return;
+    int pair=n/COUNT,c=FIRST+n%COUNT;
+    int tx=pair%TW,ty=2*(pair/TW),tile=ty*TW+tx;
+    float rows[36];
+    loadRows(ty*4-1,c,tx*4-1,0,rows);
+    storeTile(rows,tile,c);
+    if(ty+1<tilesY){
+        // Adjacent vertical tiles share their two horizontal edge transforms.
+        [[unroll]] for(int i=0;i<12;i++)rows[i]=rows[24+i];
+        loadRows(ty*4+3,c,tx*4-1,2,rows);
+        storeTile(rows,tile+TW,c);
+    }
+}
+#endif
+
 void main(){
-#if OP == 0
+#if OP == 0 && defined(REGISTER_PAIR)
+    transformTilePair();
+#elif OP == 0
     int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
     if(i>=T*COUNT)return;
     int tile=i/COUNT,c=FIRST+i%COUNT;
@@ -47,9 +126,28 @@ void main(){
 #endif
     int yy=imageTile/TW*4-1,xx=imageTile%TW*4-1;
     float v[36];
+#ifdef TUNED
+    int column[6], row[6];
+    bool validColumn[6], validRow[6];
+    [[unroll]] for(int slot=0;slot<6;slot++){
+        int x=xx+slot,y=yy+slot;
+        column[slot]=clamp(x,0,W-1)*STRIDE+c;
+        row[slot]=clamp(y,0,H-1)*W*STRIDE;
+        validColumn[slot]=x>=0&&x<W;
+        validRow[slot]=y>=0&&y<H;
+    }
+    [[unroll]]
+#endif
     for(int y=0;y<6;y++) {
         float r[6];
+#ifdef TUNED
+        [[unroll]] for(int x=0;x<6;x++){
+            float z=a[row[y]+column[x]];
+            r[x]=validRow[y]&&validColumn[x]?z:0.;
+        }
+#else
         for(int x=0;x<6;x++){ float z=a[(clamp(yy+y,0,H-1)*W+clamp(xx+x,0,W-1))*STRIDE+c]; r[x]=(yy+y>=0&&yy+y<H&&xx+x>=0&&xx+x<W)?z:0.; }
+#endif
         v[y*6+0]=4.*r[0]-5.*r[2]+r[4];
         v[y*6+1]=-4.*r[1]-4.*r[2]+r[3]+r[4];
         v[y*6+2]=4.*r[1]-4.*r[2]-r[3]+r[4];
@@ -57,6 +155,9 @@ void main(){
         v[y*6+4]=2.*r[1]-r[2]-2.*r[3]+r[4];
         v[y*6+5]=4.*r[1]-5.*r[3]+r[5];
     }
+#ifdef TUNED
+    [[unroll]]
+#endif
     for(int x=0;x<6;x++) {
         float r[6],q[6];
         for(int y=0;y<6;y++)r[y]=v[y*6+x];
@@ -66,7 +167,14 @@ void main(){
         q[3]=-2.*r[1]-r[2]+2.*r[3]+r[4];
         q[4]=2.*r[1]-r[2]-2.*r[3]+r[4];
         q[5]=4.*r[1]-5.*r[3]+r[5];
-        for(int y=0;y<6;y++)o[(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4]=q[y];
+        for(int y=0;y<6;y++){
+            int dst=(((y*6+x)*T+tile/4*4)*WINSTRIDE+c*4)+tile%4;
+#ifdef NARROW
+            halfOut[dst]=float16_t(q[y]);
+#else
+            o[dst]=q[y];
+#endif
+        }
     }
 #elif OP == 1
     uint lane=gl_SubgroupInvocationID,mi=lane>>2,ni=lane&3u;
@@ -78,9 +186,18 @@ void main(){
     uint phase=(mi+ni)&3u;
     uint ai=(plane*uint(T/4)+min((row>>2)+mi,uint(T/4-1)))*uint(WINSTRIDE)+phase;
     uint cq=min((col>>2)+ni,uint(OC/4-1));
-    uint bi=uint(p[5])/4u+(WPACKED!=0?(plane*uint(OC/4)+cq)*uint(IC)+phase:(plane*uint(IC)+phase)*uint(OC/4)+cq);
+#ifdef NARROW
+    uint weightOffset=uint(p[22])/4u;
+#else
+    uint weightOffset=uint(p[5])/4u;
+#endif
+    uint bi=weightOffset+(WPACKED!=0?(plane*uint(OC/4)+cq)*uint(IC)+phase:(plane*uint(IC)+phase)*uint(OC/4)+cq);
     uint bs=WPACKED!=0?4u:uint(OC);
     uint ar=mi*4u+((ni+1u)&3u),br=((mi+1u)&3u)*4u+ni;
+#ifdef NARROW
+    vec4 s0,s1,s2,s3;
+    packed_gemm(ai,bi,bs,ar,br,s0,s1,s2,s3);
+#else
     vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
     for(uint k=0u;k<uint(IC);k+=4u){
         vec4 av=a4[ai+k],bv=w4[bi+k/4u*bs];
@@ -92,6 +209,7 @@ void main(){
         av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
         s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
     }
+#endif
     uint r=row+mi*4u,c=col+ni*4u;
     if(c<uint(OC)){
         if(r<uint(T))o4[((plane*uint(T)+r)*uint(OC)+c)/4u]=s0;
@@ -121,7 +239,11 @@ void main(){
         r[y]=vec4(v[0]+v[1]+v[2]+v[3]+v[4],v[1]-v[2]+2.*(v[3]-v[4]),v[1]+v[2]+4.*(v[3]+v[4]),v[1]-v[2]+8.*(v[3]-v[4])+v[5]);
     }
     vec4 result[4]=vec4[4](r[0]+r[1]+r[2]+r[3]+r[4],r[1]-r[2]+2.*(r[3]-r[4]),r[1]+r[2]+4.*(r[3]+r[4]),r[1]-r[2]+8.*(r[3]-r[4])+r[5]);
-    for(int y=0;y<4;y++)for(int x=0;x<4;x++)if(yy+y<H&&xx+x<W){
+    for(int y=0;y<4;y++)for(int x=0;x<4;x++)if(
+#ifdef TUNED
+        (H%4==0&&W%4==0)||
+#endif
+        (yy+y<H&&xx+x<W)){
         int row=(yy+y)*W+xx+x;
         float v=result[y][x]+w[p[6]+c];
         if(MODE==1)v=max(v,0.)+0.2*min(v,0.);

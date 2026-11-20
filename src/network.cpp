@@ -1,15 +1,49 @@
 #include "network.h"
+#include "runtime.h"
 
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace upscaler {
+namespace {
+class ModelFile
+{
+public:
+    explicit ModelFile(const std::filesystem::path& path)
+    {
+        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            throw std::runtime_error("Cannot open model asset " + path.string());
+        struct stat info{};
+        if (fstat(fd, &info) || info.st_size <= 0) {
+            close(fd);
+            throw std::runtime_error("Cannot size model asset " + path.string());
+        }
+        size = static_cast<size_t>(info.st_size);
+        void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (map == MAP_FAILED)
+            throw std::runtime_error("Cannot map model asset " + path.string());
+        data = static_cast<const unsigned char*>(map);
+    }
+    ~ModelFile() { munmap(const_cast<unsigned char*>(data), size); }
+    ModelFile(const ModelFile&) = delete;
+    ModelFile& operator=(const ModelFile&) = delete;
+    const unsigned char* data{};
+    size_t size{};
+};
+}
 
 Network::Network(Gpu& device, Model model, const char* magic) : gpu(device), downscale(device)
 {
-    const Resource blob = embeddedResource(std::string(modeName(model)) + "/model");
+    const std::string filename = std::string(modeName(model)) + (gpu.optimized ? ".packed.dat" : ".dat");
+    const ModelFile blob(runtimeRoot() / "share/upscaler/models" / filename);
     size_t offset = 0;
     auto take = [&](size_t count) {
         if (count > blob.size - offset) throw std::runtime_error("Truncated embedded model");
@@ -24,20 +58,35 @@ Network::Network(Gpu& device, Model model, const char* magic) : gpu(device), dow
     };
     if (std::memcmp(take(8), magic, 8)) throw std::runtime_error("Invalid embedded model");
     modelVersion = read32();
-    if (modelVersion != 1 && modelVersion != 2) throw std::runtime_error("Invalid embedded model version");
+    if (gpu.optimized ? modelVersion != 3 : modelVersion != 1 && modelVersion != 2)
+        throw std::runtime_error("Model format does not match the selected inference path");
     const uint32_t count = read32(), floats = read32();
-    if (count > 4096 || floats > 70000000) throw std::runtime_error("Invalid embedded model size");
+    const uint32_t halves = modelVersion == 3 ? read32() : 0;
+    if (count > 4096 || floats > 70000000 || halves > 70000000 ||
+        (modelVersion == 3 && (halves == 0 || halves % 4)))
+        throw std::runtime_error("Invalid model size");
     for (uint32_t i = 0; i < count; ++i)
     {
         const uint32_t length = read32(), start = read32(), size = read32();
-        if (length > 512 || uint64_t(start) + size > floats) throw std::runtime_error("Invalid embedded tensor");
+        const uint32_t kind = modelVersion == 3 ? read32() : 0;
+        if (length == 0 || length > 512 || kind > 1 ||
+            uint64_t(start) + size > (kind == 0 ? floats : halves) ||
+            (modelVersion == 3 && (start % 4 || (kind && size % 4))))
+            throw std::runtime_error("Invalid tensor descriptor");
         std::string name(reinterpret_cast<const char*>(take(length)), length);
-        tensors.emplace(std::move(name), std::make_pair(start, size));
+        if (tensors.contains(name) || packedTensors.contains(name))
+            throw std::runtime_error("Duplicate model tensor " + name);
+        (kind == 0 ? tensors : packedTensors).emplace(std::move(name), std::make_pair(start, size));
     }
     const auto* data = take(size_t(floats) * 4);
-    if (offset != blob.size) throw std::runtime_error("Unexpected embedded model data");
+    const auto* packed = take(size_t(halves) * 2);
+    if (offset != blob.size) throw std::runtime_error("Unexpected model data");
     weights = gpu.buffer(floats);
     std::memcpy(weights->mapped, data, size_t(floats) * 4);
+    if (halves) {
+        halfWeights = gpu.buffer(halves / 2);
+        std::memcpy(halfWeights->mapped, packed, size_t(halves) * 2);
+    }
 }
 
 void Network::reserve(BufferPtr& buffer, size_t floats)

@@ -16,6 +16,11 @@ const char* usage()
   --raw FILE      Save unclipped HWC float32 output for validation
   --decoded FILE  Save decoded RGB input as PNG for validation
   --trace DIR     Save intermediate tensors; requires full-frame inference
+  --system-driver Use the system Vulkan loader configuration and FP32 graph
+  --fp32          Use FP32 inference with the selected driver
+  --driver-info   Print the selected Vulkan driver without running inference
+  --reference-graph  Use the validated packed graph before the transform rewrite
+  --profile FILE  Write per-dispatch GPU timestamps and report host timings
   --help          Show this help
   --version       Show the version
 
@@ -23,7 +28,8 @@ Examples:
   upscaler input.jpg --live --scale 2 output.png
   upscaler input.png --anime --scale 4 output.png
 
-Both models and all shaders are embedded. Output is always an RGB PNG.
+Models are loaded from the runtime's share/upscaler/models directory.
+Output is always an RGB PNG.
 )";
 }
 
@@ -55,6 +61,10 @@ Options parseOptions(int argc, char** argv)
             options.version = true;
             continue;
         }
+        if (arg == "--system-driver") { options.systemDriver = true; continue; }
+        if (arg == "--fp32") { options.fp32 = true; continue; }
+        if (arg == "--driver-info") { options.driverInfo = true; continue; }
+        if (arg == "--reference-graph") { options.referenceGraph = true; continue; }
         if (arg == "--live" || arg == "--anime")
         {
             Model model = arg == "--live" ? Model::Live : Model::Anime;
@@ -64,7 +74,8 @@ Options parseOptions(int argc, char** argv)
             continue;
         }
         const bool numeric = arg == "--scale" || arg == "--tile" || arg == "--halo";
-        if (!numeric && arg != "--raw" && arg != "--decoded" && arg != "--trace") throw std::invalid_argument("Unknown option: " + arg);
+        if (!numeric && arg != "--raw" && arg != "--decoded" && arg != "--trace" && arg != "--profile")
+            throw std::invalid_argument("Unknown option: " + arg);
         if (++i >= argc) throw std::invalid_argument("Missing value for " + arg);
         const std::string value = argv[i];
         if (numeric)
@@ -88,10 +99,12 @@ Options parseOptions(int argc, char** argv)
             options.raw = value;
         else if (arg == "--decoded")
             options.decoded = value;
-        else
+        else if (arg == "--trace")
             options.trace = value;
+        else
+            options.profile = value;
     }
-    if (options.help || options.version) return options;
+    if (options.help || options.version || options.driverInfo) return options;
     if (!selected) throw std::invalid_argument("Choose --live or --anime");
     if (paths.size() != 2) throw std::invalid_argument("Provide exactly one input and one output path");
     if (options.scale != 1 && options.scale != 2 && options.scale != 4) throw std::invalid_argument("Scale must be 1, 2 or 4");
@@ -101,6 +114,8 @@ Options parseOptions(int argc, char** argv)
     // Prevent overflowing crop coordinates even for malformed command lines.
     if (options.tile > 1048576 || options.halo > 1048576) throw std::invalid_argument("Tile or halo is too large");
     if (!options.trace.empty() && options.tile > 0) throw std::invalid_argument("--trace requires --tile 0");
+    if (!options.profile.empty() && !options.trace.empty())
+        throw std::invalid_argument("--profile cannot be combined with --trace");
     options.input = paths[0];
     options.output = paths[1];
     return options;

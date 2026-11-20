@@ -23,6 +23,9 @@ layout(constant_id=10) const int ADD=0;
 layout(constant_id=11) const int PACKED=0;
 // Model v2 packs selected weights as [OC/4,IC,4] for contiguous quad loads.
 layout(constant_id=12) const int WPACKED=0;
+#ifdef PACKED_DAT
+#include "packed_gemm.glsl"
+#endif
 float input_at(int row,int k) {
     if(row>=H*W||k>=IC*KS*KS)return 0.0;
     if(KS==1)return a[row*STRIDE+OFFSET+k];
@@ -108,9 +111,18 @@ void main(){
     uint phase=(mi+ni)&3u;
     uint ai=min((row>>2)+mi,uint((H*W-1)/4))*uint(IC)+phase;
     uint cq=min((col>>2)+ni,uint(OC/4-1));
-    uint bi=uint(p[5])/4u+(WPACKED!=0?cq*uint(IC)+phase:phase*uint(OC/4)+cq);
+#ifdef PACKED_DAT
+    uint weightOffset=uint(p[22])/4u;
+#else
+    uint weightOffset=uint(p[5])/4u;
+#endif
+    uint bi=weightOffset+(WPACKED!=0?cq*uint(IC)+phase:phase*uint(OC/4)+cq);
     uint bs=WPACKED!=0?4u:uint(OC);
     uint ar=mi*4u+((ni+1u)&3u),br=((mi+1u)&3u)*4u+ni;
+#ifdef PACKED_DAT
+    vec4 s0,s1,s2,s3;
+    packed_gemm(ai,bi,bs,ar,br,s0,s1,s2,s3);
+#else
     vec4 s0=vec4(0),s1=vec4(0),s2=vec4(0),s3=vec4(0);
     for(uint k=0u;k<uint(IC);k+=4u){
         vec4 av=a4[ai+k],bv=w4[bi+k/4u*bs];
@@ -122,6 +134,7 @@ void main(){
         av=subgroupShuffle(av,ar);bv=subgroupShuffle(bv,br);
         s0+=av.x*bv;s1+=av.y*bv;s2+=av.z*bv;s3+=av.w*bv;
     }
+#endif
     int r=int(row+mi*4u),c=int(col+ni*4u);
     store_row(r,c,s0);store_row(r+1,c,s1);store_row(r+2,c,s2);store_row(r+3,c,s3);
 }

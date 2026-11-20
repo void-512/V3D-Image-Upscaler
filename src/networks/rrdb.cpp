@@ -29,7 +29,7 @@ public:
         size_t tiles = (((H + 3) / 4) * ((W + 3) / 4) + 3) / 4 * 4;
         {
             // Transforms die before the upsampling tail reuses these buffers.
-            reserve(hi0, std::max(size_t(N) * 4 * 64, tiles * 36 * 192));
+            reserve(hi0, std::max(size_t(N) * 4 * 64, tiles * 36 * (gpu.optimized ? 96 : 192)));
             reserve(hi1, std::max(size_t(std::min(H * 4, strip + 4)) * W * 4 * 64, tiles * 36 * 64));
             winIn = hi0;
             winOut = hi1;
@@ -58,18 +58,31 @@ public:
             int tiles = ((h + 3) / 4) * ((w + 3) / 4);
             p[12] = (tiles + 3) / 4 * 4;
             p[13] = (w + 3) / 4;
-            p[5] = tensors.at(name + ".winograd").first;
+            if (gpu.optimized)
+                p[22] = packedTensors.at(name + ".winograd").first;
+            else
+                p[5] = tensors.at(name + ".winograd").first;
             // Linear input transforms for earlier dense features remain valid.
             // Transform only the newly appended 32 channels at each growth step.
             p[14] = ic == 64 ? 0 : ic - 32;
             p[15] = ic == 64 ? 64 : 32;
             p[21] = modelVersion >= 2 && ic == 192 && oc == 64;
-            int groups = (p[12] * p[15] + 191) / 192, gx = std::min(groups, 65535);
-            gpu.dispatch("conv_win_in", {in, {}, winIn, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
-            gpu.dispatch("conv_win_mul", {winIn, {}, winOut, weights, {}, {}}, p, (oc + 15) / 16, 3 * ((p[12] + 15) / 16), 1);
+            // Limit FP32 pairing to tiles large enough to amortize shader compilation.
+            constexpr int minimumFp32PairedPixels = 128 * 1024;
+            const bool pairFp32 = gpu.pairFp32Transforms && int64_t(h) * w >= minimumFp32PairedPixels;
+            const bool paired = h > 4 && (gpu.tuned || pairFp32);
+            const int inputTiles = paired ? ((h + 7) / 8) * p[13] : p[12];
+            int groups = (inputTiles * p[15] + 191) / 192, gx = std::min(groups, 65535);
+            const char* forward = paired ? (gpu.optimized ? "conv_win_in_pair" : "conv_win_in_pair_fp32") :
+                                  gpu.tuned ? "conv_win_in_tuned" :
+                                  gpu.optimized ? "conv_win_in_half" : "conv_win_in";
+            gpu.dispatch(forward, {in, {}, winIn, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
+            gpu.dispatch(gpu.optimized ? "conv_win_mul_half" : "conv_win_mul",
+                         {winIn, {}, winOut, weights, {}, halfWeights}, p, (oc + 15) / 16, 3 * ((p[12] + 15) / 16), 1);
             groups = (tiles * oc + 191) / 192;
             gx = std::min(groups, 65535);
-            gpu.dispatch("conv_win_out", {winOut, {}, out, weights, add, mode == 3 ? saved : BufferPtr{}}, p, gx, (groups + gx - 1) / gx, 1);
+            gpu.dispatch(gpu.tuned ? "conv_win_out_tuned" : "conv_win_out",
+                         {winOut, {}, out, weights, add, mode == 3 ? saved : BufferPtr{}}, p, gx, (groups + gx - 1) / gx, 1);
             return;
         }
         if (up == 2 && tensors.contains(name + ".polyphase"))
@@ -86,7 +99,8 @@ public:
             return;
         }
         p[5] = tensors.at(name + ".weight").first;
-        gpu.dispatch("conv_fast", {in, {}, out, weights, add, {}}, p, (oc + 15) / 16, (p[17] * w + 191) / 192, 1);
+        gpu.dispatch("conv_fast", {in, {}, out, weights, add, {}}, p,
+                     (oc + 15) / 16, (p[17] * w + 191) / 192, 1);
     }
     void pack(BufferPtr in, BufferPtr out, int mode)
     {

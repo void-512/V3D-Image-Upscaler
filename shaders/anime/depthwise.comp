@@ -6,6 +6,11 @@ layout(set=0,binding=7,std430) readonly buffer Weights4 {vec4 w4[];};
 layout(set=0,binding=1,std430) readonly buffer Gate4 {vec4 b4[];};
 layout(set=0,binding=2,std430) buffer Out4 {vec4 o4[];};
 layout(local_size_x=192) in;
+#ifdef NARROW
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(set=0,binding=2,std430) writeonly buffer HalfOutput {float16_t halfOut[];};
+#endif
 layout(constant_id=0) const int H=16;
 layout(constant_id=1) const int W=16;
 layout(constant_id=3) const int STRIDE=180;
@@ -24,7 +29,15 @@ void main(){
         }
         if(ACT!=0)v=vec4(gelu(v.x),gelu(v.y),gelu(v.z),gelu(v.w));
         if(GATE!=0)v*=b4[(pix*360+c)/4];
-        if(PACKED!=0){int dst=((pix/4)*180+c)*4+pix%4;o[dst]=v.x;o[dst+4]=v.y;o[dst+8]=v.z;o[dst+12]=v.w;}
+        if(PACKED!=0){
+            int dst=((pix/4)*180+c)*4+pix%4;
+#ifdef NARROW
+            halfOut[dst]=float16_t(v.x);halfOut[dst+4]=float16_t(v.y);
+            halfOut[dst+8]=float16_t(v.z);halfOut[dst+12]=float16_t(v.w);
+#else
+            o[dst]=v.x;o[dst+4]=v.y;o[dst+8]=v.z;o[dst+12]=v.w;
+#endif
+        }
         else o4[i]=v;
     }
 }
