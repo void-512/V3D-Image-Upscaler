@@ -25,6 +25,7 @@ void selectPrivateDriver()
     // These inherited filters would otherwise be able to exclude the sole ICD.
     unsetenv("VK_LOADER_DRIVERS_SELECT");
     unsetenv("VK_LOADER_DRIVERS_DISABLE");
+    unsetenv("VK_ADD_DRIVER_FILES");
     std::cerr << "Private Vulkan ICD " << manifest << '\n';
 }
 }

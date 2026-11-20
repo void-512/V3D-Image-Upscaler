@@ -4,9 +4,6 @@
 
 namespace upscaler {
 
-inline constexpr int animeWinogradTiles = 512;
-inline constexpr int animeAttentionWindows = 64;
-
 class Network
 {
 public:
@@ -26,15 +23,14 @@ protected:
     void dump(BufferPtr buffer, const std::string& name, int count);
 
     Gpu& gpu;
-    uint32_t modelVersion = 0;
     Downscale downscale;
     BufferPtr weights, halfWeights;
     std::map<std::string, std::pair<int, int> > tensors;
     std::map<std::string, std::pair<int, int> > packedTensors;
 };
 
-int liveStripRows(int height, int width);
-uint64_t estimatedMemory(Model model, int height, int width, int scale);
+int liveStripRows(int height, int width, const Config& config);
+uint64_t estimatedMemory(Model model, int height, int width, int scale, const Config& config);
 std::unique_ptr<Network> makeAnimeNetwork(Gpu& gpu);
 std::unique_ptr<Network> makeLiveNetwork(Gpu& gpu);
 

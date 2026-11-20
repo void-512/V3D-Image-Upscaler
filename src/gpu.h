@@ -1,5 +1,5 @@
 #pragma once
-#include "resources.h"
+#include "config.h"
 #include <vulkan/vulkan.h>
 #include <array>
 #include <chrono>
@@ -50,14 +50,13 @@ public:
     std::string shaderPrefix;
     uint32_t queueFamily = 0;
     bool uniformInputAlias = false;
-    bool optimized = false, tuned = false;
-    bool pairFp32Transforms = false;
+    bool tuned = false;
+    const Config config;
     // Optional benchmark instrumentation; empty in normal inference.
     std::function<void(const std::string&, const Params&, bool)> observeDispatch;
     std::function<void(double, double)> observeBatch;
 
-    explicit Gpu(Model model, bool performanceQueries = false, bool uniformAlias = false,
-                 bool usePacked = false, bool requirePrivate = false);
+    explicit Gpu(Model model, const Config& config = {}, bool performanceQueries = false, bool uniformAlias = false);
 
     ~Gpu();
 
@@ -70,6 +69,7 @@ public:
     void begin();
 
     void dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t x, uint32_t y = 1, uint32_t z = 1);
+    void dispatchLinear(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t elements);
 
     void finish();
 

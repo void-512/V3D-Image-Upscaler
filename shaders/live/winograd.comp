@@ -5,7 +5,15 @@
 #ifdef TUNED
 #extension GL_EXT_control_flow_attributes : require
 #endif
+#if OP == 1
 layout(local_size_x=16,local_size_y=12) in;
+#else
+layout(local_size_x=16,local_size_y=12,local_size_y_id=23) in;
+int transformIndex(){
+    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+    return int(group*gl_WorkGroupSize.x*gl_WorkGroupSize.y+gl_LocalInvocationIndex);
+}
+#endif
 layout(set=0,binding=0,std430) readonly buffer Input {float a[];};
 #if OP == 1
 layout(set=0,binding=2,std430) buffer Output {vec4 o4[];};
@@ -95,7 +103,7 @@ void storeTile(float rows[36],int tile,int c){
 }
 
 void transformTilePair(){
-    int n=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
+    int n=transformIndex();
     int tilesY=(H+3)/4;
     if(n>=((tilesY+1)/2)*TW*COUNT)return;
     int pair=n/COUNT,c=FIRST+n%COUNT;
@@ -116,7 +124,7 @@ void main(){
 #if OP == 0 && defined(REGISTER_PAIR)
     transformTilePair();
 #elif OP == 0
-    int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
+    int i=transformIndex();
     if(i>=T*COUNT)return;
     int tile=i/COUNT,c=FIRST+i%COUNT;
 #ifdef ANIME
@@ -218,7 +226,7 @@ void main(){
         if(r+3u<uint(T))o4[((plane*uint(T)+r+3u)*uint(OC)+c)/4u]=s3;
     }
 #else
-    int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+gl_LocalInvocationIndex);
+    int i=transformIndex();
     #ifdef ANIME
     int tiles=p[17];
 #else

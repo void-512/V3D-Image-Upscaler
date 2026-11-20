@@ -10,18 +10,18 @@ void check(VkResult r)
 {
     if (r != VK_SUCCESS) throw std::runtime_error("Vulkan error " + std::to_string(r));
 }
-Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias, bool usePacked, bool requirePrivate)
-    : shaderPrefix(std::string(modeName(model)) + "/"), uniformInputAlias(uniformAlias), optimized(usePacked)
+Gpu::Gpu(Model model, const Config& config, bool performanceQueries, bool uniformAlias)
+    : shaderPrefix(std::string(modeName(model)) + "/"), uniformInputAlias(uniformAlias), config(config)
 {
+    selectPrivateDriver();
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "Pi 5 Upscaler";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     const VkResult status = vkCreateInstance(&ci, nullptr, &instance);
-    if (status != VK_SUCCESS && requirePrivate)
+    if (status != VK_SUCCESS)
         throw std::runtime_error("Could not initialize the private V3DV ICD (Vulkan error " + std::to_string(status) + ")");
-    check(status);
     uint32_t count = 0;
     check(vkEnumeratePhysicalDevices(instance, &count, nullptr));
     std::vector<VkPhysicalDevice> devices(count);
@@ -36,7 +36,7 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias, bool usePacked
             VkPhysicalDeviceProperties2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
             info.pNext = &driver;
             vkGetPhysicalDeviceProperties2(d, &info);
-            if (requirePrivate && std::string_view(driver.driverInfo).find(privateDriverTag) == std::string_view::npos)
+            if (std::string_view(driver.driverInfo).find(privateDriverTag) == std::string_view::npos)
                 continue;
             physical = d;
             properties = pr;
@@ -45,8 +45,10 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias, bool usePacked
         }
     }
     if (!physical)
-        throw std::runtime_error(requirePrivate ? "The private V3DV ICD did not provide a hardware V3D device" :
-                                 "A hardware V3D Vulkan device is required");
+        throw std::runtime_error("The private V3DV ICD did not provide a hardware V3D device");
+    if (const auto size = uint32_t(config.linearWorkgroupSize);
+        size > std::min(properties.limits.maxComputeWorkGroupInvocations, properties.limits.maxComputeWorkGroupSize[0]))
+        throw std::runtime_error("performance.linear_workgroup_size exceeds the Vulkan device limit");
     VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 pr2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     pr2.pNext = &sg;
@@ -81,18 +83,16 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias, bool usePacked
     features13.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceFeatures enabled{};
     enabled.fragmentStoresAndAtomics = VK_TRUE;
-    if (optimized && (!features12.shaderFloat16 || !features11.storageBuffer16BitAccess ||
-                      !features.features.shaderInt16))
+    if (!features12.shaderFloat16 || !features11.storageBuffer16BitAccess ||
+        !features.features.shaderInt16)
         throw std::runtime_error("Packed inference requires V3D native FP16 arithmetic and 16-bit storage");
     features12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     features11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    if (optimized) {
-        features13.pNext = &features12;
-        features12.pNext = &features11;
-        features12.shaderFloat16 = VK_TRUE;
-        features11.storageBuffer16BitAccess = VK_TRUE;
-        enabled.shaderInt16 = VK_TRUE;
-    }
+    features13.pNext = &features12;
+    features12.pNext = &features11;
+    features12.shaderFloat16 = VK_TRUE;
+    features11.storageBuffer16BitAccess = VK_TRUE;
+    enabled.shaderInt16 = VK_TRUE;
     di.pNext = &features13;
     VkPhysicalDevicePerformanceQueryFeaturesKHR perf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR};
     const char* perfExtension = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
@@ -103,10 +103,7 @@ Gpu::Gpu(Model model, bool performanceQueries, bool uniformAlias, bool usePacked
         vkGetPhysicalDeviceFeatures2(physical, &supported);
         if (!perf.performanceCounterQueryPools) throw std::runtime_error("Performance queries unavailable");
         perf.performanceCounterMultipleQueryPools = VK_FALSE;
-        if (optimized)
-            features11.pNext = &perf;
-        else
-            features13.pNext = &perf;
+        features11.pNext = &perf;
         di.enabledExtensionCount = 1;
         di.ppEnabledExtensionNames = &perfExtension;
     }
@@ -223,6 +220,15 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
             entries.push_back({uint32_t(i), uint32_t(i * 4), 4});
         }
     if (pipelines.count(key)) return pipelines.at(key);
+    Params constants = p;
+    const bool transform = name.starts_with("conv_win_in") || name.starts_with("conv_win_out");
+    if (transform || name == "copy" || name == "depthwise" || name == "depthwise_half" || name == "pack")
+    {
+        constexpr uint32_t localSizeId = 23;
+        // Transforms retain a 16-wide X dimension and specialize the Y dimension.
+        constants[localSizeId] = transform ? config.linearWorkgroupSize / 16 : config.linearWorkgroupSize;
+        entries.push_back({localSizeId, localSizeId * sizeof(int), sizeof(int)});
+    }
     const bool common = name == "output4";
     const Resource code = embeddedResource((common ? "common/" : shaderPrefix) + name);
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -236,7 +242,7 @@ VkPipeline Gpu::pipeline(const std::string& name, const Params& p)
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = module;
     ci.stage.pName = "main";
-    VkSpecializationInfo spec{uint32_t(entries.size()), entries.data(), sizeof(Params), p.data()};
+    VkSpecializationInfo spec{uint32_t(entries.size()), entries.data(), sizeof(constants), constants.data()};
     if (!entries.empty()) ci.stage.pSpecializationInfo = &spec;
     VkPipeline result;
     if (std::getenv("UPSCALER_TRACE_PIPELINES"))
@@ -317,6 +323,14 @@ void Gpu::dispatch(const std::string& name, std::array<BufferPtr, 6> buffers, co
     vkCmdDispatch(cmd, x, y, z);
     ++descriptorSetsUsed;
     if (observeDispatch) observeDispatch(name, p, false);
+}
+
+void Gpu::dispatchLinear(const std::string& name, std::array<BufferPtr, 6> buffers, const Params& p, uint32_t elements)
+{
+    const uint32_t size = config.linearWorkgroupSize;
+    const uint32_t groups = (elements + size - 1) / size;
+    const uint32_t x = std::min(groups, properties.limits.maxComputeWorkGroupCount[0]);
+    dispatch(name, std::move(buffers), p, x, (groups + x - 1) / x);
 }
 
 void Gpu::finish()

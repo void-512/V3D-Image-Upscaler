@@ -1,0 +1,21 @@
+[performance]
+# Switch to tiling when the estimated full-frame working set exceeds this size.
+tile_memory_threoshold_mib = 2048
+# Local size for Winograd transforms, DAT copy and depthwise, and RRDB packing.
+linear_workgroup_size = 192
+
+[anime]
+# -1 chooses automatically. 0 forces full-frame inference.
+tile = -1
+tile_size = 448
+halo = 48
+# Scratch batch sizes. Smaller batches use less memory and issue more dispatches.
+winograd_tiles = 512
+attention_windows = 64
+
+[live]
+tile = -1
+tile_size = 576
+halo = 96
+# Upper bound on the rows processed together by the 4x upsampling tail.
+max_strip_rows = 256

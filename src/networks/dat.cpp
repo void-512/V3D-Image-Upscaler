@@ -16,7 +16,14 @@ public:
         W = w;
         N = h * w;
         chunks = (N + 255) / 256;
-        if (estimatedMemory(Model::Anime, h, w, scale) > uint64_t(3) * 1024 * 1024 * 1024) throw std::runtime_error("Full-frame working set exceeds 3 GiB; use --tile 256 (changes global attention)");
+        if (estimatedMemory(Model::Anime, h, w, scale, gpu.config) > uint64_t(3) * 1024 * 1024 * 1024)
+            throw std::runtime_error("Full-frame working set exceeds 3 GiB; use --tile 256 (changes global attention)");
+        const int animeWinogradTiles = gpu.config.animeWinogradTiles;
+        const int animeAttentionWindows = gpu.config.animeAttentionWindows;
+        const size_t tiles = (size_t((H + 3) / 4) * ((W + 3) / 4) + 3) / 4 * 4;
+        const size_t windows = size_t((H + 15) / 16 * 16) * ((W + 15) / 16 * 16) / 128;
+        gpu.reserveDispatches(826 + 24 * ((tiles + animeWinogradTiles - 1) / animeWinogradTiles - 1)
+                                  + 108 * ((windows + animeAttentionWindows - 1) / animeAttentionWindows - 1));
         wide.reset();
         gate.reset();
         reserve(input, size_t(N) * 3);
@@ -24,16 +31,12 @@ public:
         reserve(residual, size_t(N) * 180);
         reserve(x, size_t((N + 3) / 4 * 4) * 180);
         reserve(norm, size_t((N + 3) / 4 * 4) * 180);
-        const size_t tiles = (size_t((H + 3) / 4) * ((W + 3) / 4) + 3) / 4 * 4;
         reserve(qkv, std::max({size_t(N) * 540, size_t(5400), std::min(tiles, size_t(animeWinogradTiles)) * 36 * 180}));
         reserve(conv, size_t(N) * 180);
         // QKV dies before spatial interaction/FFN; gate dies before convolution.
         wide = qkv;
         gate = conv;
         reserve(mixed, size_t((N + 3) / 4 * 4) * 180);
-        const size_t windows = size_t((H + 15) / 16 * 16) * ((W + 15) / 16 * 16) / 128;
-        gpu.reserveDispatches(826 + 24 * ((tiles + animeWinogradTiles - 1) / animeWinogradTiles - 1)
-                                  + 108 * ((windows + animeAttentionWindows - 1) / animeAttentionWindows - 1));
         reserve(partial, std::max({size_t(chunks) * 5400, std::min(tiles, size_t(animeWinogradTiles)) * 36 * 180, std::min(windows, size_t(animeAttentionWindows)) * 49152}));
         reserve(small0, 180);
         reserve(small1, 180);
@@ -41,15 +44,14 @@ public:
         reserve(spatialMap, N);
         reserve(channelScores, 5400);
         reserve(norms, 360);
-        if (gpu.optimized)
-            reserve(halfProbabilities, std::min(windows, size_t(animeAttentionWindows)) * 24576);
+        reserve(halfProbabilities, std::min(windows, size_t(animeAttentionWindows)) * 24576);
         reserve(output, size_t(N) * scale * scale * 3);
     }
     BufferPtr halfProbabilities;
     void op(int kind, BufferPtr a, BufferPtr b, BufferPtr out, Params p, int groups, BufferPtr aux = {}, BufferPtr extra = {})
     {
         int gx = std::min(groups, 65535), gy = (groups + gx - 1) / gx;
-        gpu.dispatch(kind == 4 && gpu.optimized ? "op4_half" : "op" + std::to_string(kind),
+        gpu.dispatch(kind == 4 ? "op4_half" : "op" + std::to_string(kind),
                      {a, b, out, weights, aux, extra}, p, gx, gy, 1);
     }
     void linear(BufferPtr in, BufferPtr out, const std::string& name, int ic, int oc, int kernel = 1, int activation = 0, BufferPtr add = {}, int count = -1, int stride = 0, int offset = 0, bool packed = false)
@@ -70,24 +72,21 @@ public:
             const int tiles = ((H + 3) / 4) * ((W + 3) / 4);
             p[13] = (W + 3) / 4;
             p[15] = ic;
-            p[21] = modelVersion >= 2;
-            // Bound transform scratch; each batch still reads the full image.
+            p[21] = 1;
+            // Start each batch on a 16-tile GEMM row block to preserve accumulation order.
+            const int animeWinogradTiles = gpu.config.animeWinogradTiles;
             for (int first = 0; first < tiles; first += animeWinogradTiles)
             {
                 p[16] = first;
                 p[17] = std::min(animeWinogradTiles, tiles - first);
                 p[12] = (p[17] + 3) / 4 * 4;
-                int groups = (p[12] * ic + 191) / 192, gx = std::min(groups, 65535);
-                gpu.dispatch("conv_win_in", {in, {}, qkv, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
+                gpu.dispatchLinear("conv_win_in", {in, {}, qkv, weights, {}, {}}, p, p[12] * ic);
                 gpu.dispatch("conv_win_mul", {qkv, {}, partial, weights, {}, {}}, p, (oc + 15) / 16, 3 * ((p[12] + 15) / 16), 1);
-                groups = (p[17] * oc + 191) / 192;
-                gx = std::min(groups, 65535);
-                gpu.dispatch("conv_win_out", {partial, {}, out, weights, add, {}}, p, gx, (groups + gx - 1) / gx, 1);
+                gpu.dispatchLinear("conv_win_out", {partial, {}, out, weights, add, {}}, p, p[17] * oc);
             }
             return;
         }
-        const bool narrow = gpu.optimized && packed;
-        if (narrow)
+        if (packed)
             p[22] = packedTensors.at(name + ".weight").first;
         else
             p[5] = at(name + ".weight");
@@ -97,10 +96,10 @@ public:
         p[9] = offset;
         p[10] = bool(add);
         p[11] = packed;
-        p[12] = modelVersion >= 2 && packed && ic == 180 && (oc == 180 || oc == 360);
+        p[12] = packed && ic == 180 && (oc == 180 || oc == 360);
         int tile = 192;
-        gpu.dispatch(narrow ? "gemm_fast_half" : "gemm_fast",
-                     {in, {}, out, weights, add, narrow ? halfWeights : BufferPtr{}},
+        gpu.dispatch(packed ? "gemm_fast_half" : "gemm_fast",
+                     {in, {}, out, weights, add, packed ? halfWeights : BufferPtr{}},
                      p, (oc + 15) / 16, (p[0] * p[1] + tile - 1) / tile, 1);
     }
     void layernorm(BufferPtr in, BufferPtr out, const std::string& name, int stride = 180, int offset = 0, bool packed = false)
@@ -113,7 +112,7 @@ public:
         p[4] = at(name + ".weight");
         p[5] = at(name + ".bias");
         p[6] = packed;
-        gpu.dispatch(packed && gpu.optimized ? "norm_half" : "norm",
+        gpu.dispatch(packed ? "norm_half" : "norm",
                      {in, {}, out, weights, {}, {}}, p, (N + 11) / 12, 1, 1);
     }
     void depthwise(BufferPtr in, BufferPtr out, const std::string& name, bool activation, int stride, int offset, BufferPtr multiply = {})
@@ -129,9 +128,8 @@ public:
         p[7] = activation;
         p[8] = bool(multiply);
         p[9] = bool(multiply);
-        int groups = (N * 45 + 191) / 192, gx = std::min(groups, 65535);
-        gpu.dispatch(multiply && gpu.optimized ? "depthwise_half" : "depthwise",
-                     {in, multiply, out, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
+        gpu.dispatchLinear(multiply ? "depthwise_half" : "depthwise",
+                           {in, multiply, out, weights, {}, {}}, p, N * 45);
     }
     void poolMean(BufferPtr in)
     {
@@ -143,6 +141,7 @@ public:
     }
     void execute(int scale) override
     {
+        const int animeAttentionWindows = gpu.config.animeAttentionWindows;
         gpu.begin();
         linear(input, shallow, "conv_first", 3, 180, 3);
         dump(shallow, "shallow", N * 180);
@@ -152,9 +151,7 @@ public:
             // Save the group residual before updating x in place.
             Params copyParams{};
             copyParams[0] = N * 45;
-            const int groups = (copyParams[0] + 191) / 192, gx = std::min(groups, 65535);
-            gpu.dispatch("copy", {x, {}, residual, {}, {}, {}}, copyParams,
-                         gx, (groups + gx - 1) / gx, 1);
+            gpu.dispatchLinear("copy", {x, {}, residual, {}, {}, {}}, copyParams, copyParams[0]);
             std::string group = "layers." + std::to_string(g);
             for (int block = 0; block < 6; block++)
             {
@@ -188,11 +185,10 @@ public:
                                 p[10] = first;
                                 p[11] = std::min(animeAttentionWindows, windows - first);
                                 gpu.dispatch("window_qk", {qkv, {}, partial, weights, {}, {}}, p, 8, 2, p[11]);
-                                const auto probabilities = gpu.optimized ? halfProbabilities : partial;
-                                gpu.dispatch(gpu.optimized ? "softmax_half" : "softmax",
-                                             {partial, {}, probabilities, weights, {}, {}}, p, p[11] * 32, 1, 1);
-                                gpu.dispatch(gpu.optimized ? "window_av_half" : "window_av",
-                                             {qkv, probabilities, attention, weights, {}, {}}, p, 2, 2, p[11]);
+                                gpu.dispatch("softmax_half",
+                                             {partial, {}, halfProbabilities, weights, {}, {}}, p, p[11] * 32, 1, 1);
+                                gpu.dispatch("window_av_half",
+                                             {qkv, halfProbabilities, attention, weights, {}, {}}, p, 2, 2, p[11]);
                             }
                         }
                     }

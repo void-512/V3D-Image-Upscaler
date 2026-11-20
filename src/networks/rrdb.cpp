@@ -11,11 +11,14 @@ public:
     }
     void allocate(int h, int w, int scale) override
     {
-        if (estimatedMemory(Model::Live, h, w, scale) > uint64_t(3) * 1024 * 1024 * 1024) throw std::runtime_error("Working set exceeds 3 GiB; use --tile 256");
+        if (estimatedMemory(Model::Live, h, w, scale, gpu.config) > uint64_t(3) * 1024 * 1024 * 1024)
+            throw std::runtime_error("Working set exceeds 3 GiB; use --tile 256");
         H = h;
         W = w;
         N = h * w;
-        const int strip = liveStripRows(H, W);
+        const int strip = liveStripRows(H, W, gpu.config);
+        // Bound descriptor usage by the trunk plus the six dispatches in each tail strip.
+        gpu.reserveDispatches(1100 + 6 * ((H * 4 + strip - 1) / strip));
         winIn.reset();
         winOut.reset();
         rgb.reset();
@@ -29,7 +32,7 @@ public:
         size_t tiles = (((H + 3) / 4) * ((W + 3) / 4) + 3) / 4 * 4;
         {
             // Transforms die before the upsampling tail reuses these buffers.
-            reserve(hi0, std::max(size_t(N) * 4 * 64, tiles * 36 * (gpu.optimized ? 96 : 192)));
+            reserve(hi0, std::max(size_t(N) * 4 * 64, tiles * 36 * 96));
             reserve(hi1, std::max(size_t(std::min(H * 4, strip + 4)) * W * 4 * 64, tiles * 36 * 64));
             winIn = hi0;
             winOut = hi1;
@@ -58,31 +61,22 @@ public:
             int tiles = ((h + 3) / 4) * ((w + 3) / 4);
             p[12] = (tiles + 3) / 4 * 4;
             p[13] = (w + 3) / 4;
-            if (gpu.optimized)
-                p[22] = packedTensors.at(name + ".winograd").first;
-            else
-                p[5] = tensors.at(name + ".winograd").first;
+            p[22] = packedTensors.at(name + ".winograd").first;
             // Linear input transforms for earlier dense features remain valid.
             // Transform only the newly appended 32 channels at each growth step.
             p[14] = ic == 64 ? 0 : ic - 32;
             p[15] = ic == 64 ? 64 : 32;
-            p[21] = modelVersion >= 2 && ic == 192 && oc == 64;
-            // Limit FP32 pairing to tiles large enough to amortize shader compilation.
-            constexpr int minimumFp32PairedPixels = 128 * 1024;
-            const bool pairFp32 = gpu.pairFp32Transforms && int64_t(h) * w >= minimumFp32PairedPixels;
-            const bool paired = h > 4 && (gpu.tuned || pairFp32);
+            p[21] = ic == 192 && oc == 64;
+            const bool paired = h > 4 && gpu.tuned;
             const int inputTiles = paired ? ((h + 7) / 8) * p[13] : p[12];
-            int groups = (inputTiles * p[15] + 191) / 192, gx = std::min(groups, 65535);
-            const char* forward = paired ? (gpu.optimized ? "conv_win_in_pair" : "conv_win_in_pair_fp32") :
+            const char* forward = paired ? "conv_win_in_pair" :
                                   gpu.tuned ? "conv_win_in_tuned" :
-                                  gpu.optimized ? "conv_win_in_half" : "conv_win_in";
-            gpu.dispatch(forward, {in, {}, winIn, weights, {}, {}}, p, gx, (groups + gx - 1) / gx, 1);
-            gpu.dispatch(gpu.optimized ? "conv_win_mul_half" : "conv_win_mul",
+                                  "conv_win_in_half";
+            gpu.dispatchLinear(forward, {in, {}, winIn, weights, {}, {}}, p, inputTiles * p[15]);
+            gpu.dispatch("conv_win_mul_half",
                          {winIn, {}, winOut, weights, {}, halfWeights}, p, (oc + 15) / 16, 3 * ((p[12] + 15) / 16), 1);
-            groups = (tiles * oc + 191) / 192;
-            gx = std::min(groups, 65535);
-            gpu.dispatch(gpu.tuned ? "conv_win_out_tuned" : "conv_win_out",
-                         {winOut, {}, out, weights, add, mode == 3 ? saved : BufferPtr{}}, p, gx, (groups + gx - 1) / gx, 1);
+            gpu.dispatchLinear(gpu.tuned ? "conv_win_out_tuned" : "conv_win_out",
+                               {winOut, {}, out, weights, add, mode == 3 ? saved : BufferPtr{}}, p, tiles * oc);
             return;
         }
         if (up == 2 && tensors.contains(name + ".polyphase"))
@@ -107,8 +101,7 @@ public:
         Params p{};
         p[0] = N;
         p[1] = mode;
-        int groups = (N * 64 + 191) / 192, gx = std::min(groups, 65535);
-        gpu.dispatch("pack", {in, {}, out, {}, saved, {}}, p, gx, (groups + gx - 1) / gx, 1);
+        gpu.dispatchLinear("pack", {in, {}, out, {}, saved, {}}, p, N * 64);
     }
     void execute(int scale) override
     {
@@ -137,7 +130,7 @@ public:
         conv(x, hi0, "conv_up1", H * 2, W * 2, 64, 64, 64, 64, 0, 1, 2);
         // Stream the 4x tail in strips, retaining its complete two-row context.
         // Coordinates remain global, so only true image edges receive padding.
-        const int strip = liveStripRows(H, W);
+        const int strip = liveStripRows(H, W, gpu.config);
         for (int top = 0; top < H * 4; top += strip)
         {
             const int end = std::min(top + strip, H * 4);

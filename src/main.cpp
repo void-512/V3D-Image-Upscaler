@@ -1,6 +1,5 @@
 #include "options.h"
 #include "dispatch_profile.h"
-#include "runtime.h"
 #include "upscale.h"
 #include "png_writer.h"
 #include "stb_image.h"
@@ -27,11 +26,8 @@ int main(int argc, char** argv)
             std::cout << "upscaler " << UPSCALER_VERSION << '\n';
             return 0;
         }
-        const bool privateDriver = UPSCALER_PRIVATE_DRIVER && !options.systemDriver;
-        if (privateDriver)
-            selectPrivateDriver();
         if (options.driverInfo) {
-            Gpu gpu(options.model, false, false, false, privateDriver);
+            Gpu gpu(options.model, options.config);
             return 0;
         }
         RunTimings host;
@@ -45,15 +41,16 @@ int main(int argc, char** argv)
         if (options.tile == -1)
         {
             const bool largeAttention = options.model == Model::Anime && uint64_t((height + 15) / 16 * 16) * ((width + 15) / 16 * 16) * 384 * 4 > uint64_t(1) * 1024 * 1024 * 1024;
-            options.tile = estimatedMemory(options.model, height, width, options.scale) > uint64_t(2) * 1024 * 1024 * 1024 || largeAttention ? (options.model == Model::Anime ? 448 : 576) : 0;
+            const auto memoryLimit = uint64_t(options.config.tileMemoryThresholdMiB) * 1024 * 1024;
+            const bool tile = estimatedMemory(options.model, height, width, options.scale, options.config) > memoryLimit || largeAttention;
+            options.tile = tile ? options.config.tiling(options.model).tileSize : 0;
         }
         if (options.tile && !options.trace.empty()) throw std::runtime_error("--trace requires --tile 0");
         if (options.tile) std::cerr << "Tiling: core=" << options.tile << ", halo=" << options.halo << ". Cropped-context output can differ from full-frame inference.\n";
         const auto driverStart = Clock::now();
-        Gpu gpu(options.model, false, false, privateDriver && !options.fp32, privateDriver);
+        Gpu gpu(options.model, options.config);
         host.driver = Milliseconds(Clock::now() - driverStart).count();
-        gpu.tuned = gpu.optimized && !options.referenceGraph;
-        gpu.pairFp32Transforms = privateDriver && options.fp32 && !options.referenceGraph;
+        gpu.tuned = !options.referenceGraph;
         DispatchProfile timings(gpu, options.profile);
         const auto modelStart = Clock::now();
         auto network = options.model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);

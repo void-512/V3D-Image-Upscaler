@@ -5,7 +5,7 @@ layout(set=0,binding=6,std430) readonly buffer In4 {vec4 a4[];};
 layout(set=0,binding=7,std430) readonly buffer Weights4 {vec4 w4[];};
 layout(set=0,binding=1,std430) readonly buffer Gate4 {vec4 b4[];};
 layout(set=0,binding=2,std430) buffer Out4 {vec4 o4[];};
-layout(local_size_x=192) in;
+layout(local_size_x=192, local_size_x_id=23) in;
 #ifdef NARROW
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -19,7 +19,7 @@ layout(constant_id=7) const int ACT=0;
 layout(constant_id=8) const int GATE=0;
 layout(constant_id=9) const int PACKED=0;
 void main(){
-    int i=int(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*192+int(gl_LocalInvocationID.x);
+    int i=int((gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*gl_WorkGroupSize.x+gl_LocalInvocationID.x);
     if(i<H*W*45){
         int c=(i%45)*4,pix=i/45,y=pix/W,x=pix%W;
         vec4 v=w4[(p[6]+c)/4];

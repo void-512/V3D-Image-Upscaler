@@ -1,5 +1,5 @@
 #pragma once
-#include "resources.h"
+#include "config.h"
 #include <string>
 
 namespace upscaler {
@@ -8,7 +8,8 @@ struct Options
     Model model = Model::Live;
     int scale = 4, tile = -1, halo = -1;
     bool help = false, version = false;
-    bool systemDriver = false, fp32 = false, driverInfo = false, referenceGraph = false;
+    bool driverInfo = false, referenceGraph = false;
+    Config config;
     std::string input, output, raw, decoded, trace;
     std::string profile;
 };

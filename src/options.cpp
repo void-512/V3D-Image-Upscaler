@@ -11,13 +11,12 @@ const char* usage()
   --live          RealESRGAN_x4plus for photographs and live-action images
   --anime         APISR DAT-GAN for anime and illustrations
   --scale 1|2|4     Output scale (default: 4; 1/2 use GPU downsampling of 4x)
+  --config FILE   Load performance settings from a TOML file
   --tile N        Tile core size, multiple of 16; 0 forces full frame
   --halo N        Context halo, multiple of 16 (live: 96, anime: 48)
   --raw FILE      Save unclipped HWC float32 output for validation
   --decoded FILE  Save decoded RGB input as PNG for validation
   --trace DIR     Save intermediate tensors; requires full-frame inference
-  --system-driver Use the system Vulkan loader configuration and FP32 graph
-  --fp32          Use FP32 inference with the selected driver
   --driver-info   Print the selected Vulkan driver without running inference
   --reference-graph  Use the validated packed graph before the transform rewrite
   --profile FILE  Write per-dispatch GPU timestamps and report host timings
@@ -29,6 +28,7 @@ Examples:
   upscaler input.png --anime --scale 4 output.png
 
 Models are loaded from the runtime's share/upscaler/models directory.
+Without --config, config.toml is searched in the working directory, then the runtime root.
 Output is always an RGB PNG.
 )";
 }
@@ -37,6 +37,7 @@ Options parseOptions(int argc, char** argv)
 {
     Options options;
     bool selected = false, positionalOnly = false;
+    std::filesystem::path configFile;
     std::vector<std::string> paths;
     for (int i = 1; i < argc; ++i)
     {
@@ -61,8 +62,6 @@ Options parseOptions(int argc, char** argv)
             options.version = true;
             continue;
         }
-        if (arg == "--system-driver") { options.systemDriver = true; continue; }
-        if (arg == "--fp32") { options.fp32 = true; continue; }
         if (arg == "--driver-info") { options.driverInfo = true; continue; }
         if (arg == "--reference-graph") { options.referenceGraph = true; continue; }
         if (arg == "--live" || arg == "--anime")
@@ -74,7 +73,7 @@ Options parseOptions(int argc, char** argv)
             continue;
         }
         const bool numeric = arg == "--scale" || arg == "--tile" || arg == "--halo";
-        if (!numeric && arg != "--raw" && arg != "--decoded" && arg != "--trace" && arg != "--profile")
+        if (!numeric && arg != "--config" && arg != "--raw" && arg != "--decoded" && arg != "--trace" && arg != "--profile")
             throw std::invalid_argument("Unknown option: " + arg);
         if (++i >= argc) throw std::invalid_argument("Missing value for " + arg);
         const std::string value = argv[i];
@@ -95,6 +94,11 @@ Options parseOptions(int argc, char** argv)
                 options.halo = number;
             }
         }
+        else if (arg == "--config")
+        {
+            if (value.empty()) throw std::invalid_argument("--config requires a file path");
+            configFile = value;
+        }
         else if (arg == "--raw")
             options.raw = value;
         else if (arg == "--decoded")
@@ -104,15 +108,23 @@ Options parseOptions(int argc, char** argv)
         else
             options.profile = value;
     }
-    if (options.help || options.version || options.driverInfo) return options;
+    if (options.help || options.version) return options;
+    if (options.driverInfo)
+    {
+        options.config = loadConfig(configFile);
+        return options;
+    }
     if (!selected) throw std::invalid_argument("Choose --live or --anime");
     if (paths.size() != 2) throw std::invalid_argument("Provide exactly one input and one output path");
     if (options.scale != 1 && options.scale != 2 && options.scale != 4) throw std::invalid_argument("Scale must be 1, 2 or 4");
     if (options.tile > 0 && options.tile % 16) throw std::invalid_argument("Tile must be a multiple of 16");
-    if (options.halo == -1) options.halo = options.model == Model::Anime ? 48 : 96;
-    if (options.halo % 16) throw std::invalid_argument("Halo must be a multiple of 16");
+    if (options.halo > 0 && options.halo % 16) throw std::invalid_argument("Halo must be a multiple of 16");
     // Prevent overflowing crop coordinates even for malformed command lines.
-    if (options.tile > 1048576 || options.halo > 1048576) throw std::invalid_argument("Tile or halo is too large");
+    if (options.tile > maxTileDimension || options.halo > maxTileDimension) throw std::invalid_argument("Tile or halo is too large");
+    options.config = loadConfig(configFile);
+    const auto& tiling = options.config.tiling(options.model);
+    if (options.tile == -1) options.tile = tiling.tile;
+    if (options.halo == -1) options.halo = tiling.halo;
     if (!options.trace.empty() && options.tile > 0) throw std::invalid_argument("--trace requires --tile 0");
     if (!options.profile.empty() && !options.trace.empty())
         throw std::invalid_argument("--profile cannot be combined with --trace");

@@ -19,7 +19,9 @@ find_program(GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" REQUIRED)
 
 find_path(UPSCALER_STB_INCLUDE NAMES stb_image.h
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb" PATH_SUFFIXES stb REQUIRED)
-option(UPSCALER_BUILD_PRIVATE_DRIVER "Build and select private Mesa V3DV by default" ON)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlplusplus/include/toml++/toml.hpp")
+    message(FATAL_ERROR "toml++ is missing. Run git submodule update --init third_party/tomlplusplus.")
+endif()
 set(UPSCALER_MESA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mesa" CACHE PATH "Mesa 26.2.7 source checkout")
 set(UPSCALER_MESA_JOBS 3 CACHE STRING "Maximum parallel jobs inside the Mesa build")
 set(UPSCALER_MODEL_BUNDLE "" CACHE FILEPATH "Optional legacy upscaler executable containing v2 model assets")
@@ -28,25 +30,28 @@ set(UPSCALER_LIVE_MODEL "" CACHE FILEPATH "Optional preconverted live v2 model")
 option(UPSCALER_DOWNLOAD_MODELS "Fetch pinned official checkpoints when missing" ON)
 set(UPSCALER_RUNTIME_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "Staging root for bin, lib and share")
 
-if(UPSCALER_BUILD_PRIVATE_DRIVER)
-    find_program(MESON_EXECUTABLE meson REQUIRED)
-    find_program(NINJA_EXECUTABLE ninja REQUIRED)
-    set(icd_library "${UPSCALER_RUNTIME_DIR}/lib/libvulkan_broadcom.so")
-    set(icd_manifest "${UPSCALER_RUNTIME_DIR}/share/vulkan/icd.d/broadcom_custom.json")
-    set(mesa_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/mesa/0001-v3dv-upscaler-packed-fp16.patch")
-    set(mesa_builder "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_v3dv.py")
-    add_custom_command(OUTPUT "${icd_library}" "${icd_manifest}"
-        COMMAND "${Python3_EXECUTABLE}" -B "${mesa_builder}"
-            --source "${UPSCALER_MESA_SOURCE}" --build "${CMAKE_CURRENT_BINARY_DIR}/private-mesa"
-            --patch "${mesa_patch}" --library "${icd_library}" --manifest "${icd_manifest}"
-            --meson "${MESON_EXECUTABLE}" --ninja "${NINJA_EXECUTABLE}" --jobs "${UPSCALER_MESA_JOBS}"
-        COMMAND "${CMAKE_STRIP}" --strip-unneeded "${icd_library}"
-        DEPENDS "${mesa_builder}" "${mesa_patch}" "${UPSCALER_MESA_SOURCE}/VERSION"
-        COMMENT "Building private Mesa 26.2.7 V3DV ICD" VERBATIM)
-    add_custom_target(private_v3dv DEPENDS "${icd_library}" "${icd_manifest}")
-    install(FILES "${icd_library}" DESTINATION lib)
-    install(FILES "${icd_manifest}" DESTINATION share/vulkan/icd.d)
+find_program(MESON_EXECUTABLE meson REQUIRED)
+find_program(NINJA_EXECUTABLE ninja REQUIRED)
+set(icd_library "${UPSCALER_RUNTIME_DIR}/lib/libvulkan_broadcom.so")
+set(icd_manifest "${UPSCALER_RUNTIME_DIR}/share/vulkan/icd.d/broadcom_custom.json")
+set(mesa_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/mesa/0001-v3dv-upscaler-packed-fp16.patch")
+set(mesa_builder "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_v3dv.py")
+add_custom_command(OUTPUT "${icd_library}" "${icd_manifest}"
+    COMMAND "${Python3_EXECUTABLE}" -B "${mesa_builder}"
+        --source "${UPSCALER_MESA_SOURCE}" --build "${CMAKE_CURRENT_BINARY_DIR}/private-mesa"
+        --patch "${mesa_patch}" --library "${icd_library}" --manifest "${icd_manifest}"
+        --meson "${MESON_EXECUTABLE}" --ninja "${NINJA_EXECUTABLE}" --jobs "${UPSCALER_MESA_JOBS}"
+    COMMAND "${CMAKE_STRIP}" --strip-unneeded "${icd_library}"
+    DEPENDS "${mesa_builder}" "${mesa_patch}" "${UPSCALER_MESA_SOURCE}/VERSION"
+    COMMENT "Building private Mesa 26.2.7 V3DV ICD" VERBATIM)
+add_custom_target(private_v3dv DEPENDS "${icd_library}" "${icd_manifest}")
+install(FILES "${icd_library}" DESTINATION lib)
+install(FILES "${icd_manifest}" DESTINATION share/vulkan/icd.d)
+
+if(NOT EXISTS "${UPSCALER_RUNTIME_DIR}/config.toml")
+    configure_file(config.toml "${UPSCALER_RUNTIME_DIR}/config.toml" COPYONLY)
 endif()
+install(FILES config.toml DESTINATION .)
 
 function(upscaler_zlib)
     set(BUILD_SHARED_LIBS OFF)
@@ -72,9 +77,9 @@ set(resource_manifest "")
 set(resource_dependencies "")
 
 function(upscaler_model mode checkpoint reference local_model url digest)
-    set(directory "${UPSCALER_RUNTIME_DIR}/share/upscaler/models")
+    set(directory "${generated}/models")
     set(output "${directory}/${mode}.dat")
-    set(packed "${directory}/${mode}.packed.dat")
+    set(packed "${UPSCALER_RUNTIME_DIR}/share/upscaler/models/${mode}.packed.dat")
     set(converter "${CMAKE_CURRENT_SOURCE_DIR}/tools/convert_${mode}.py")
     set(packager "${CMAKE_CURRENT_SOURCE_DIR}/tools/package_model.py")
     if(local_model)
@@ -105,16 +110,11 @@ function(upscaler_model mode checkpoint reference local_model url digest)
             DEPENDS "${file}" "${converter}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/reference/${reference}"
             COMMENT "Converting ${mode} weights" VERBATIM)
     endif()
-    if(UPSCALER_BUILD_PRIVATE_DRIVER)
-        add_custom_command(OUTPUT "${packed}"
-            COMMAND "${Python3_EXECUTABLE}" -B "${packager}" "${mode}" "${output}" "${packed}"
-            DEPENDS "${packager}" "${output}" COMMENT "Prepacking ${mode} weights" VERBATIM)
-        install(FILES "${packed}" DESTINATION share/upscaler/models)
-        set(model_outputs "${model_outputs};${output};${packed}" PARENT_SCOPE)
-    else()
-        set(model_outputs "${model_outputs};${output}" PARENT_SCOPE)
-    endif()
-    install(FILES "${output}" DESTINATION share/upscaler/models)
+    add_custom_command(OUTPUT "${packed}"
+        COMMAND "${Python3_EXECUTABLE}" -B "${packager}" "${mode}" "${output}" "${packed}"
+        DEPENDS "${packager}" "${output}" COMMENT "Prepacking ${mode} weights" VERBATIM)
+    install(FILES "${packed}" DESTINATION share/upscaler/models)
+    set(model_outputs "${model_outputs};${packed}" PARENT_SCOPE)
 endfunction()
 
 upscaler_model(anime 4x_APISR_DAT_GAN_generator.pth dat.py "${UPSCALER_ANIME_MODEL}"
@@ -144,12 +144,11 @@ function(upscaler_shader mode name source)
     set(resource_dependencies "${resource_dependencies}" PARENT_SCOPE)
 endfunction()
 
-foreach(shader gemm_fast channel_fast channel_av softmax norm depthwise copy)
+foreach(shader gemm_fast channel_fast channel_av norm depthwise copy)
     upscaler_shader(anime "${shader}" "${shader}.comp")
 endforeach()
 upscaler_shader(anime window_qk window.comp -DQK)
-upscaler_shader(anime window_av window.comp)
-foreach(op 2 3 4 6 7 8 9)
+foreach(op 2 3 6 7 8 9)
     upscaler_shader(anime "op${op}" ops.comp "-DOP=${op}")
 endforeach()
 upscaler_shader(anime conv_win_in ../live/winograd.comp -DOP=0 -DANIME)
@@ -163,14 +162,11 @@ upscaler_shader(anime softmax_half softmax.comp -DNARROW)
 upscaler_shader(anime window_av_half window.comp -DNARROW_AV)
 upscaler_shader(live conv_fast conv.comp -DRGB_FAST)
 upscaler_shader(live conv_poly conv.comp -DPOLYPHASE)
-upscaler_shader(live conv_win_in winograd.comp -DOP=0)
-upscaler_shader(live conv_win_mul winograd.comp -DOP=1)
 upscaler_shader(live conv_win_out winograd.comp -DOP=2)
 upscaler_shader(live conv_win_in_half winograd.comp -DOP=0 -DNARROW)
 upscaler_shader(live conv_win_mul_half winograd.comp -DOP=1 -DNARROW)
 upscaler_shader(live conv_win_in_tuned winograd.comp -DOP=0 -DNARROW -DTUNED)
 upscaler_shader(live conv_win_in_pair winograd.comp -DOP=0 -DNARROW -DTUNED -DREGISTER_PAIR)
-upscaler_shader(live conv_win_in_pair_fp32 winograd.comp -DOP=0 -DTUNED -DREGISTER_PAIR)
 upscaler_shader(live conv_win_out_tuned winograd.comp -DOP=2 -DTUNED)
 upscaler_shader(live pack pack.comp)
 upscaler_shader(common output4 output4.comp)
@@ -188,27 +184,24 @@ add_custom_command(OUTPUT "${generated}/resources.S" "${generated}/resources.cpp
 add_executable(upscaler
     src/main.cpp
     src/runtime.cpp
-    src/options.cpp src/upscale.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp src/downscale.cpp src/image_io.cpp
+    src/config.cpp src/options.cpp src/upscale.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp src/downscale.cpp src/image_io.cpp
     src/networks/dat.cpp src/networks/rrdb.cpp
     "${generated}/resources.cpp" "${generated}/resources.S")
 target_compile_features(upscaler PRIVATE cxx_std_20)
 target_include_directories(upscaler PRIVATE src "${UPSCALER_STB_INCLUDE}")
-target_compile_definitions(upscaler PRIVATE UPSCALER_VERSION="${PROJECT_VERSION}"
-    UPSCALER_PRIVATE_DRIVER=$<BOOL:${UPSCALER_BUILD_PRIVATE_DRIVER}>)
+target_include_directories(upscaler SYSTEM PRIVATE third_party/tomlplusplus/include)
+target_compile_definitions(upscaler PRIVATE UPSCALER_VERSION="${PROJECT_VERSION}")
 target_compile_options(upscaler PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-mcpu=cortex-a76>")
 target_link_libraries(upscaler PRIVATE Vulkan::Vulkan ${zlib_target})
 set_target_properties(upscaler PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${UPSCALER_RUNTIME_DIR}/bin")
-add_dependencies(upscaler upscaler_models)
-if(UPSCALER_BUILD_PRIVATE_DRIVER)
-    add_dependencies(upscaler private_v3dv)
-endif()
+add_dependencies(upscaler upscaler_models private_v3dv)
 install(TARGETS upscaler RUNTIME DESTINATION bin)
 
 include(CTest)
 option(UPSCALER_GPU_TESTS "Run CTest Vulkan device checks on a Raspberry Pi 5" OFF)
 if(BUILD_TESTING)
     add_test(NAME upscaler_version COMMAND upscaler --version)
-    if(UPSCALER_GPU_TESTS AND UPSCALER_BUILD_PRIVATE_DRIVER)
+    if(UPSCALER_GPU_TESTS)
         add_test(NAME upscaler_private_driver COMMAND upscaler --driver-info)
     endif()
 endif()
