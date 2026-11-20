@@ -1,6 +1,7 @@
 #include "config.h"
 #include "runtime.h"
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -103,7 +104,7 @@ Config loadConfig(const std::filesystem::path& requested, std::vector<Task>* tas
             {
                 const std::string key = std::string(section.str()) + "." + std::string(name.str());
                 if (key == "performance.tile_memory_threoshold_mib")
-                    config.tileMemoryThresholdMiB = integer(value, key, 1, 3072);
+                    config.tileMemoryThresholdMiB = integer(value, key, 1, std::numeric_limits<int>::max());
                 else if (key == "performance.linear_workgroup_size")
                     config.linearWorkgroupSize = integer(value, key, 16, 256, 16);
                 else if (key == "anime.winograd_tiles")

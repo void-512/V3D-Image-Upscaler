@@ -2,6 +2,16 @@
 #include <algorithm>
 
 namespace upscaler {
+namespace {
+int liveStripRows(int h, int w, const Config& config)
+{
+    // Fit the tail and its halos in the trunk's dense and transform buffers.
+    const auto tiles = winogradTileCount(h, w);
+    const int rows = std::min(h * 3 / 4 - 2, int(tiles * 9 / w) - 4);
+    return std::clamp(rows / 16 * 16, 96, config.liveMaxStripRows);
+}
+}
+
 class RRDBNet final : public Network
 {
 public:
@@ -9,10 +19,25 @@ public:
     explicit RRDBNet(Gpu& gpu) : Network(gpu, Model::Live, "RRDBV3D!")
     {
     }
+    static auto bufferSizes(int h, int w, int scale, int strip)
+    {
+        const size_t pixels = size_t(h) * w;
+        const auto tiles = winogradTileCount(h, w);
+        using Size = std::pair<BufferPtr RRDBNet::*, size_t>;
+        return std::to_array<Size>({
+            {&RRDBNet::input, pixels * 3},
+            {&RRDBNet::shallow, pixels * 64},
+            {&RRDBNet::saved, pixels * 64},
+            {&RRDBNet::dense, std::max(pixels * 192, size_t(std::min(h * 4, strip + 2)) * w * 256)},
+            {&RRDBNet::x, pixels * 64},
+            {&RRDBNet::output, pixels * scale * scale * 3},
+            // The forward Winograd transform stores 192 FP16 channels, or 96 32-bit words.
+            {&RRDBNet::hi0, std::max(pixels * 256, tiles * 36 * 96)},
+            {&RRDBNet::hi1, std::max(size_t(std::min(h * 4, strip + 4)) * w * 256, tiles * 36 * 64)},
+        });
+    }
     void allocate(int h, int w, int scale) override
     {
-        if (estimatedMemory(Model::Live, h, w, scale, gpu.config) > uint64_t(3) * 1024 * 1024 * 1024)
-            throw std::runtime_error("Working set exceeds 3 GiB; use --tile 256");
         H = h;
         W = w;
         N = h * w;
@@ -22,21 +47,12 @@ public:
         winIn.reset();
         winOut.reset();
         rgb.reset();
-        reserve(input, size_t(N) * 3);
-        reserve(shallow, size_t(N) * 64);
-        reserve(saved, size_t(N) * 64);
-        reserve(dense, std::max(size_t(N) * 192, size_t(std::min(H * 4, strip + 2)) * W * 4 * 64));
-        reserve(x, size_t(N) * 64);
+        for (const auto& [buffer, elements] : bufferSizes(h, w, scale, strip))
+            reserve(this->*buffer, elements);
         rgb = x; // The 64-channel trunk result dies after the first upsampling.
-        reserve(output, size_t(N) * scale * scale * 3);
-        size_t tiles = (((H + 3) / 4) * ((W + 3) / 4) + 3) / 4 * 4;
-        {
-            // Transforms die before the upsampling tail reuses these buffers.
-            reserve(hi0, std::max(size_t(N) * 4 * 64, tiles * 36 * 96));
-            reserve(hi1, std::max(size_t(std::min(H * 4, strip + 4)) * W * 4 * 64, tiles * 36 * 64));
-            winIn = hi0;
-            winOut = hi1;
-        }
+        // Transforms die before the upsampling tail reuses these buffers.
+        winIn = hi0;
+        winOut = hi1;
     }
     void conv(BufferPtr in, BufferPtr out, const std::string& name, int h, int w, int ic, int oc, int stride, int outstride, int offset, int mode = 0, int up = 1, BufferPtr add = {}, int top = 0, int rows = 0, int inputTop = 0, int outputTop = 0)
     {
@@ -140,6 +156,11 @@ public:
         downscale.record(rgb, output, H, W, scale, Model::Live);
     }
 };
+
+uint64_t liveBufferBytes(int h, int w, int scale, const Config& config)
+{
+    return bufferBytes(RRDBNet::bufferSizes(h, w, scale, liveStripRows(h, w, config)));
+}
 
 std::unique_ptr<Network> makeLiveNetwork(Gpu& gpu)
 { return std::make_unique<RRDBNet>(gpu); }

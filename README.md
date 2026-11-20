@@ -36,6 +36,14 @@ Use [config.toml](config.toml) to set inference options or queue images. Pass `-
 
 Repeat `-i INPUT --live -o OUTPUT` or `-i INPUT --anime -o OUTPUT` to queue tasks. Command-line tasks run before entries from the config. Paths in the config are relative to that file.
 
+## Benchmark
+
+```sh
+upscaler --benchmark --width 128 --height 96 --warmup 1 --loop 3
+```
+
+Both models benchmark 4× inference on the same in-memory RGB image, generated from a fixed random seed. Supply both dimensions on the command line. The config still controls inference tuning such as tiling and workgroup size.
+
 ## Memory and tiling
 
 Automatic tiling limits GPU memory use. Tiling can change the output where a tile has less image context. Use `--tile 0` for full-frame inference when memory permits. `--tile` and `--halo` override the config.

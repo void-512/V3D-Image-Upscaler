@@ -2,6 +2,13 @@
 #include <algorithm>
 
 namespace upscaler {
+namespace {
+size_t spatialWindowCount(int h, int w)
+{
+    return size_t((h + 15) / 16 * 16) * ((w + 15) / 16 * 16) / 128;
+}
+}
+
 class DatNetwork final : public Network
 {
 public:
@@ -10,42 +17,53 @@ public:
     explicit DatNetwork(Gpu& gpu) : Network(gpu, Model::Anime, "APISRDAT")
     {
     }
+    static auto bufferSizes(int h, int w, int scale, const Config& config)
+    {
+        const size_t pixels = size_t(h) * w;
+        const size_t alignedFeatures = (pixels + 3) / 4 * 4 * 180;
+        const size_t chunks = (pixels + 255) / 256;
+        const size_t winograd = std::min(winogradTileCount(h, w), size_t(config.animeWinogradTiles)) * 36 * 180;
+        const size_t attentionBatch = std::min(spatialWindowCount(h, w), size_t(config.animeAttentionWindows));
+        using Size = std::pair<BufferPtr DatNetwork::*, size_t>;
+        return std::to_array<Size>({
+            {&DatNetwork::input, pixels * 3},
+            {&DatNetwork::shallow, pixels * 180},
+            {&DatNetwork::residual, pixels * 180},
+            {&DatNetwork::x, alignedFeatures},
+            {&DatNetwork::norm, alignedFeatures},
+            {&DatNetwork::qkv, std::max({pixels * 540, size_t(5400), winograd})},
+            {&DatNetwork::conv, pixels * 180},
+            {&DatNetwork::mixed, alignedFeatures},
+            {&DatNetwork::partial, std::max({chunks * 5400, winograd, attentionBatch * 49152})},
+            {&DatNetwork::small0, 180},
+            {&DatNetwork::small1, 180},
+            {&DatNetwork::channelMap, 180},
+            {&DatNetwork::spatialMap, pixels},
+            {&DatNetwork::channelScores, 5400},
+            {&DatNetwork::norms, 360},
+            {&DatNetwork::halfProbabilities, attentionBatch * 24576},
+            {&DatNetwork::output, pixels * scale * scale * 3},
+        });
+    }
     void allocate(int h, int w, int scale) override
     {
         H = h;
         W = w;
         N = h * w;
         chunks = (N + 255) / 256;
-        if (estimatedMemory(Model::Anime, h, w, scale, gpu.config) > uint64_t(3) * 1024 * 1024 * 1024)
-            throw std::runtime_error("Full-frame working set exceeds 3 GiB; use --tile 256 (changes global attention)");
         const int animeWinogradTiles = gpu.config.animeWinogradTiles;
         const int animeAttentionWindows = gpu.config.animeAttentionWindows;
-        const size_t tiles = (size_t((H + 3) / 4) * ((W + 3) / 4) + 3) / 4 * 4;
-        const size_t windows = size_t((H + 15) / 16 * 16) * ((W + 15) / 16 * 16) / 128;
+        const size_t tiles = winogradTileCount(h, w);
+        const size_t windows = spatialWindowCount(h, w);
         gpu.reserveDispatches(826 + 24 * ((tiles + animeWinogradTiles - 1) / animeWinogradTiles - 1)
                                   + 108 * ((windows + animeAttentionWindows - 1) / animeAttentionWindows - 1));
         wide.reset();
         gate.reset();
-        reserve(input, size_t(N) * 3);
-        reserve(shallow, size_t(N) * 180);
-        reserve(residual, size_t(N) * 180);
-        reserve(x, size_t((N + 3) / 4 * 4) * 180);
-        reserve(norm, size_t((N + 3) / 4 * 4) * 180);
-        reserve(qkv, std::max({size_t(N) * 540, size_t(5400), std::min(tiles, size_t(animeWinogradTiles)) * 36 * 180}));
-        reserve(conv, size_t(N) * 180);
+        for (const auto& [buffer, elements] : bufferSizes(h, w, scale, gpu.config))
+            reserve(this->*buffer, elements);
         // QKV dies before spatial interaction/FFN; gate dies before convolution.
         wide = qkv;
         gate = conv;
-        reserve(mixed, size_t((N + 3) / 4 * 4) * 180);
-        reserve(partial, std::max({size_t(chunks) * 5400, std::min(tiles, size_t(animeWinogradTiles)) * 36 * 180, std::min(windows, size_t(animeAttentionWindows)) * 49152}));
-        reserve(small0, 180);
-        reserve(small1, 180);
-        reserve(channelMap, 180);
-        reserve(spatialMap, N);
-        reserve(channelScores, 5400);
-        reserve(norms, 360);
-        reserve(halfProbabilities, std::min(windows, size_t(animeAttentionWindows)) * 24576);
-        reserve(output, size_t(N) * scale * scale * 3);
     }
     BufferPtr halfProbabilities;
     void op(int kind, BufferPtr a, BufferPtr b, BufferPtr out, Params p, int groups, BufferPtr aux = {}, BufferPtr extra = {})
@@ -242,6 +260,11 @@ public:
         downscale.record(norm, output, H, W, scale, Model::Anime);
     }
 };
+
+uint64_t animeBufferBytes(int h, int w, int scale, const Config& config)
+{
+    return bufferBytes(DatNetwork::bufferSizes(h, w, scale, config));
+}
 
 std::unique_ptr<Network> makeAnimeNetwork(Gpu& gpu)
 { return std::make_unique<DatNetwork>(gpu); }

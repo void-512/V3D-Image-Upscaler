@@ -31,7 +31,9 @@ Options parseBenchmark(int argc, char** argv)
     for (int i = 1; i < argc && std::string_view(argv[i]) != "--"; ++i)
     {
         const std::string arg = argv[i];
-        if (arg != "--config" && arg != "--warmup" && arg != "--loop") continue;
+        if (arg != "--config" && arg != "--warmup" && arg != "--loop" &&
+            arg != "--width" && arg != "--height")
+            continue;
         if (++i >= argc || std::string_view(argv[i]) == "--")
             throw std::invalid_argument("Missing value for " + arg);
         const std::string value = argv[i];
@@ -45,12 +47,22 @@ Options parseBenchmark(int argc, char** argv)
             options.warmup = parseInteger(arg, value);
             if (options.warmup < 0) throw std::invalid_argument("--warmup must be nonnegative");
         }
-        else
+        else if (arg == "--loop")
         {
             options.loops = parseInteger(arg, value);
             if (options.loops < 1) throw std::invalid_argument("--loop must be positive");
         }
+        else
+        {
+            const int dimension = parseInteger(arg, value);
+            if (dimension < 1) throw std::invalid_argument(arg + " must be positive");
+            (arg == "--width" ? options.benchmarkWidth : options.benchmarkHeight) = dimension;
+        }
     }
+    if (!options.benchmarkWidth || !options.benchmarkHeight)
+        throw std::invalid_argument("--benchmark requires both --width and --height");
+    if (!validImageDimensions(options.benchmarkWidth, options.benchmarkHeight))
+        throw std::invalid_argument("Benchmark image dimensions too large");
     options.config = loadConfig(configFile);
     return options;
 }
@@ -67,7 +79,7 @@ const char* usage()
 {
     return R"(Usage: upscaler INPUT (--live | --anime) [options] OUTPUT.png
        upscaler -i INPUT (--live | --anime) [options] -o OUTPUT.png [-i INPUT ...]
-       upscaler --benchmark [--warmup M] [--loop N] [--config FILE]
+       upscaler --benchmark --width X --height Y [--warmup M] [--loop N] [--config FILE]
        upscaler [--config FILE]
 
   -i INPUT        Start a command-line task
@@ -79,6 +91,8 @@ const char* usage()
   --tile N        Tile core size, multiple of 16; 0 forces full frame
   --halo N        Context halo, multiple of 16 (live: 96, anime: 48)
   --benchmark     Time inference for both models using the configured tuning
+  --width X       Benchmark input width in pixels (required with --benchmark)
+  --height Y      Benchmark input height in pixels (required with --benchmark)
   --warmup M      Benchmark warmup passes per model (default: 1)
   --loop N        Timed benchmark passes per model (default: 3)
   --help          Show this help
@@ -91,7 +105,7 @@ Examples:
 Models are loaded from the runtime's share/upscaler/models directory.
 Without --config, config.toml is searched in the working directory, then the runtime root.
 Command-line tasks run before [[tasks]] entries. Each task produces an RGB PNG.
-Benchmark mode uses a built-in image and reads only --warmup, --loop and --config.
+Benchmark mode generates random RGB pixels at the command-line dimensions.
 )";
 }
 

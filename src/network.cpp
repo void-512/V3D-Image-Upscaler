@@ -1,11 +1,17 @@
 #include "network.h"
-#include <algorithm>
 #include <cstring>
 
 namespace upscaler {
+namespace {
+Resource modelResource(Model model)
+{
+    return embeddedResource(model == Model::Anime ? "anime/model" : "live/model");
+}
+}
+
 Network::Network(Gpu& device, Model model, const char* magic) : gpu(device), downscale(device)
 {
-    const auto blob = embeddedResource(std::string(modeName(model)) + "/model");
+    const auto blob = modelResource(model);
     size_t offset = 0;
     auto take = [&](size_t count) {
         if (count > blob.size - offset) throw std::runtime_error("Truncated model asset");
@@ -61,40 +67,15 @@ int Network::at(const std::string& name) const
     return tensors.at(name).first;
 }
 
-int liveStripRows(int h, int w, const Config& config)
-{
-    // Fit the tail and its halos in the trunk's dense and transform buffers.
-    const int tiles = (((h + 3) / 4) * ((w + 3) / 4) + 3) / 4 * 4;
-    const int rows = std::min(h * 3 / 4 - 2, int(int64_t(tiles) * 9 / w) - 4);
-    return std::clamp(rows / 16 * 16, 96, config.liveMaxStripRows);
-}
-
 uint64_t estimatedMemory(Model model, int h, int w, int scale, const Config& config)
 {
-    // Reserve for up to 4H * 2W RGBA32 Lanczos texels.
-    constexpr int outputScratch = 32;
-    if (model == Model::Anime)
-    {
-        const uint64_t n = uint64_t(h) * w, padded = (n + 3) / 4 * 4;
-        const uint64_t tiles = (uint64_t((h + 3) / 4) * ((w + 3) / 4) + 3) / 4 * 4;
-        const uint64_t win = std::min(tiles, uint64_t(config.animeWinogradTiles)) * 36 * 180;
-        const uint64_t windows = uint64_t((h + 15) / 16 * 16) * ((w + 15) / 16 * 16) / 128;
-        const uint64_t attentionBatch = std::min(windows, uint64_t(config.animeAttentionWindows));
-        return (n * (544 + scale * scale * 3 + outputScratch) + padded * 360
-                + std::max({n * 540, uint64_t(5400), win})
-                + padded * 180
-                + std::max({(n + 255) / 256 * 5400, win, attentionBatch * 49152})
-                + attentionBatch * 24576) * 4
-               + 96 * 1024 * 1024;
-    }
-    const uint64_t pixels = uint64_t(h) * w;
-    const uint64_t tiles = (uint64_t((h + 3) / 4) * ((w + 3) / 4) + 3) / 4 * 4;
-    const int strip = liveStripRows(h, w, config);
-    return pixels * (3 + 3 * 64 + scale * scale * 3 + outputScratch) * 4
-           + std::max(pixels * 192, uint64_t(std::min(h * 4, strip + 2)) * w * 256) * 4
-           + (std::max(pixels * 256, tiles * 36 * 192)
-              + std::max(uint64_t(std::min(h * 4, strip + 4)) * w * 256, tiles * 36 * 64)) * 4
-           + 272 * 1024 * 1024;
+    const auto buffers = model == Model::Anime ? animeBufferBytes(h, w, scale, config)
+                                              : liveBufferBytes(h, w, scale, config);
+    // The model asset includes both weight buffers and a small tensor directory.
+    const auto weights = modelResource(model).size;
+    // Scales below 4x render a 4H by scale*W RGBA32 Lanczos intermediate.
+    const uint64_t texels = scale == 4 ? 0 : uint64_t(h) * w * 4 * scale;
+    return buffers + weights + texels * 4 * sizeof(float);
 }
 
 } // namespace upscaler

@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <set>
 
 using namespace upscaler;
@@ -70,19 +71,22 @@ void runBenchmark(const Options& options)
 {
     using Clock = std::chrono::steady_clock;
     using Milliseconds = std::chrono::duration<double, std::milli>;
-    constexpr int size = 96, scale = 4;
-    std::vector<unsigned char> pixels(size * size * 3);
-    for (int y = 0; y < size; ++y)
-        for (int x = 0; x < size; ++x)
-        {
-            auto* rgb = pixels.data() + (y * size + x) * 3;
-            rgb[0] = x * 255 / (size - 1);
-            rgb[1] = y * 255 / (size - 1);
-            rgb[2] = (3 * x + 5 * y) % 256;
-        }
+    constexpr int scale = 4;
+    const int width = options.benchmarkWidth, height = options.benchmarkHeight;
+    const size_t stride = size_t(width) * 3;
+    std::vector<unsigned char> pixels(stride * height);
+    // Use a fixed seed so timing comparisons can reuse the same workload.
+    std::mt19937 random;
+    std::uniform_int_distribution<int> channel(0, 255);
+    for (int y = 0; y < height; ++y)
+    {
+        checkInterrupted();
+        std::generate_n(pixels.data() + y * stride, stride,
+                        [&] { return static_cast<unsigned char>(channel(random)); });
+    }
 
     const auto& config = options.config;
-    std::cout << "Benchmark " << size << 'x' << size << " RGB at " << scale << "x, warmup=" << options.warmup
+    std::cout << "Benchmark " << width << 'x' << height << " RGB at " << scale << "x, warmup=" << options.warmup
               << ", loops=" << options.loops << ", workgroup=" << config.linearWorkgroupSize << std::endl;
     for (const auto model : {Model::Anime, Model::Live})
     {
@@ -92,16 +96,16 @@ void runBenchmark(const Options& options)
         task.scale = scale;
         task.tile = config.tiling(model).tile;
         task.halo = config.tiling(model).halo;
-        task.tile = resolveTile(task, config, size, size);
+        task.tile = resolveTile(task, config, width, height);
         Gpu gpu(model, config);
         auto network = model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
         if (!task.tile)
         {
-            network->allocate(size, size, scale);
-            upload(*network, model, pixels.data(), size, 0, 0);
+            network->allocate(height, width, scale);
+            upload(*network, model, pixels.data(), width, 0, 0);
         }
         const auto infer = [&] {
-            upscale(*network, pixels.data(), size, size, task);
+            upscale(*network, pixels.data(), width, height, task);
         };
         for (int i = 0; i < options.warmup; ++i)
             infer();
@@ -131,7 +135,7 @@ void runTask(Task task, const Config& config)
         stbi_load(task.input.c_str(), &width, &height, nullptr, 3), stbi_image_free);
     checkInterrupted();
     if (!pixels) throw std::runtime_error(std::string("Cannot decode input: ") + stbi_failure_reason());
-    if (width <= 0 || height <= 0 || int64_t(width) * height > INT32_MAX / 48)
+    if (!validImageDimensions(width, height))
         throw std::runtime_error("Image dimensions too large");
     task.tile = resolveTile(task, config, width, height);
     if (task.tile)
