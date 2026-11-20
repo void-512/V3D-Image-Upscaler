@@ -64,7 +64,7 @@ struct Band
 };
 }
 
-void upscale(Network& network, const unsigned char* pixels, int width, int height, const Options& options,
+void upscale(Network& network, const unsigned char* pixels, int width, int height, const Task& options,
              const std::vector<ScaleSink>& sinks, RunTimings* timings)
 {
     using Clock = std::chrono::steady_clock;

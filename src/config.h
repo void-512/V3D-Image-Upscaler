@@ -1,7 +1,8 @@
 #pragma once
 
-#include "resources.h"
+#include "task.h"
 #include <filesystem>
+#include <vector>
 
 namespace upscaler {
 struct TileConfig
@@ -25,5 +26,5 @@ struct Config
 };
 
 inline constexpr int maxTileDimension = 1048576;
-Config loadConfig(const std::filesystem::path& requested);
+Config loadConfig(const std::filesystem::path& requested, std::vector<Task>& tasks);
 } // namespace upscaler

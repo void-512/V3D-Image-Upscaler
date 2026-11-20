@@ -5,6 +5,8 @@
 #include <string>
 
 namespace upscaler {
+std::filesystem::path resolveOutputPath(std::filesystem::path path);
+
 // Stage regular files on their destination filesystem so publishing is atomic.
 class OutputFile
 {

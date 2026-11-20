@@ -10,6 +10,17 @@
 #include <unistd.h>
 
 namespace upscaler {
+std::filesystem::path resolveOutputPath(std::filesystem::path path)
+{
+    // Preserve writing through symlinks, including links to a new file.
+    for (int links = 0; is_symlink(symlink_status(path)); ++links)
+    {
+        if (links == 40) throw std::runtime_error("Too many symlinks for output " + path.string());
+        path = path.parent_path() / read_symlink(path);
+    }
+    return path;
+}
+
 OutputFile::OutputFile(const std::string& path) : destination(path)
 {
     if (path.empty()) return;
@@ -18,12 +29,7 @@ OutputFile::OutputFile(const std::string& path) : destination(path)
     const bool replacing = is_regular_file(status);
     if (!exists(status) || replacing)
     {
-        // Preserve writing through symlinks, including links to a new file.
-        for (int links = 0; is_symlink(symlink_status(destination)); ++links)
-        {
-            if (links == 40) throw std::runtime_error("Too many symlinks for output " + path);
-            destination = destination.parent_path() / read_symlink(destination);
-        }
+        destination = resolveOutputPath(destination);
         std::string directory = (destination.parent_path() / ".upscaler-XXXXXX").string();
         stagingFile = directory + "/output";
         if (!mkdtemp(directory.data()))

@@ -1,6 +1,6 @@
 #pragma once
 #include "network.h"
-#include "options.h"
+#include "task.h"
 #include <functional>
 
 namespace upscaler {
@@ -15,6 +15,6 @@ struct RunTimings
     double decode = 0, driver = 0, model = 0, allocate = 0, upload = 0, blend = 0, encode = 0;
 };
 // Output sinks receive contiguous rows at their requested scale.
-void upscale(Network& network, const unsigned char* pixels, int width, int height, const Options& options,
+void upscale(Network& network, const unsigned char* pixels, int width, int height, const Task& options,
              const std::vector<ScaleSink>& sinks, RunTimings* timings = nullptr);
 } // namespace upscaler

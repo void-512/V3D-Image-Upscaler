@@ -1,17 +1,43 @@
 #include "options.h"
 #include <charconv>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace upscaler {
+namespace {
+int parseInteger(const std::string& arg, const std::string& value)
+{
+    int number;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size())
+        throw std::invalid_argument("Invalid integer for " + arg + ": " + value);
+    return number;
+}
+
+void applyDefaults(Task& task, const Config& config)
+{
+    const auto& tiling = config.tiling(task.model);
+    if (task.tile == -1) task.tile = tiling.tile;
+    if (task.halo == -1) task.halo = tiling.halo;
+    if (!task.trace.empty() && task.tile > 0) throw std::invalid_argument("--trace requires --tile 0");
+    if (!task.profile.empty() && !task.trace.empty())
+        throw std::invalid_argument("--profile cannot be combined with --trace");
+}
+}
+
 const char* usage()
 {
     return R"(Usage: upscaler INPUT (--live | --anime) [options] OUTPUT.png
+       upscaler -i INPUT (--live | --anime) [options] -o OUTPUT.png [-i INPUT ...]
+       upscaler [--config FILE]
 
+  -i INPUT        Start a command-line task
+  -o OUTPUT       Set the current task's PNG output
   --live          RealESRGAN_x4plus for photographs and live-action images
   --anime         APISR DAT-GAN for anime and illustrations
   --scale 1|2|4     Output scale (default: 4; 1/2 use GPU downsampling of 4x)
-  --config FILE   Load performance settings from a TOML file
+  --config FILE   Load performance settings and tasks from a TOML file
   --tile N        Tile core size, multiple of 16; 0 forces full frame
   --halo N        Context halo, multiple of 16 (live: 96, anime: 48)
   --raw FILE      Save unclipped HWC float32 output for validation
@@ -25,20 +51,29 @@ const char* usage()
 
 Examples:
   upscaler input.jpg --live --scale 2 output.png
-  upscaler input.png --anime --scale 4 output.png
+  upscaler -i input.png --anime -o anime.png -i photo.jpg --live --scale 2 -o photo.png
 
 Models are loaded from the runtime's share/upscaler/models directory.
 Without --config, config.toml is searched in the working directory, then the runtime root.
-Output is always an RGB PNG.
+Command-line tasks run before [[tasks]] entries. Each task produces an RGB PNG.
 )";
 }
 
 Options parseOptions(int argc, char** argv)
 {
     Options options;
-    bool selected = false, positionalOnly = false;
+    Task task;
+    bool selected = false, positionalOnly = false, named = false, taskOption = false;
     std::filesystem::path configFile;
-    std::vector<std::string> paths;
+    std::vector<std::string> positional;
+    const auto appendTask = [&] {
+        if (!selected) throw std::invalid_argument("Choose --live or --anime for each command-line task");
+        if (task.input.empty() || task.output.empty())
+            throw std::invalid_argument("Provide an input and an output path for each command-line task");
+        options.tasks.push_back(std::move(task));
+        task = Task{};
+        selected = false;
+    };
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -49,7 +84,8 @@ Options parseOptions(int argc, char** argv)
         }
         if (positionalOnly || arg.empty() || arg[0] != '-')
         {
-            paths.push_back(arg);
+            if (named) throw std::invalid_argument("Use -i and -o for all paths when specifying command-line tasks");
+            positional.push_back(arg);
             continue;
         }
         if (arg == "--help" || arg == "-h")
@@ -63,73 +99,96 @@ Options parseOptions(int argc, char** argv)
             continue;
         }
         if (arg == "--driver-info") { options.driverInfo = true; continue; }
-        if (arg == "--reference-graph") { options.referenceGraph = true; continue; }
+        if (arg == "--reference-graph")
+        {
+            task.referenceGraph = true;
+            taskOption = true;
+            continue;
+        }
         if (arg == "--live" || arg == "--anime")
         {
             Model model = arg == "--live" ? Model::Live : Model::Anime;
-            if (selected && options.model != model) throw std::invalid_argument("Choose exactly one of --live and --anime");
-            options.model = model;
+            if (selected && task.model != model) throw std::invalid_argument("Choose exactly one of --live and --anime per task");
+            task.model = model;
+            options.driverModel = model;
             selected = true;
+            taskOption = true;
             continue;
         }
         const bool numeric = arg == "--scale" || arg == "--tile" || arg == "--halo";
-        if (!numeric && arg != "--config" && arg != "--raw" && arg != "--decoded" && arg != "--trace" && arg != "--profile")
+        if (!numeric && arg != "-i" && arg != "-o" && arg != "--config" &&
+            arg != "--raw" && arg != "--decoded" && arg != "--trace" && arg != "--profile")
             throw std::invalid_argument("Unknown option: " + arg);
         if (++i >= argc) throw std::invalid_argument("Missing value for " + arg);
         const std::string value = argv[i];
-        if (numeric)
-        {
-            int number;
-            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) throw std::invalid_argument("Invalid integer for " + arg + ": " + value);
-            if (arg == "--scale") options.scale = number;
-            if (arg == "--tile")
-            {
-                if (number < 0) throw std::invalid_argument("Tile must be 0 or a positive multiple of 16");
-                options.tile = number;
-            }
-            if (arg == "--halo")
-            {
-                if (number < 16) throw std::invalid_argument("Halo must be a positive multiple of 16");
-                options.halo = number;
-            }
-        }
-        else if (arg == "--config")
+        if (arg == "--config")
         {
             if (value.empty()) throw std::invalid_argument("--config requires a file path");
             configFile = value;
+            continue;
+        }
+        taskOption = true;
+        if (numeric)
+        {
+            const int number = parseInteger(arg, value);
+            if (arg == "--scale")
+            {
+                if (!validScale(number)) throw std::invalid_argument("Scale must be 1, 2 or 4");
+                task.scale = number;
+            }
+            else if (arg == "--tile")
+            {
+                if (number < 0 || number > maxTileDimension || number % 16)
+                    throw std::invalid_argument("Tile must be 0 or a positive multiple of 16 up to " + std::to_string(maxTileDimension));
+                task.tile = number;
+            }
+            else
+            {
+                if (number < 16 || number > maxTileDimension || number % 16)
+                    throw std::invalid_argument("Halo must be a positive multiple of 16 up to " + std::to_string(maxTileDimension));
+                task.halo = number;
+            }
+        }
+        else if (arg == "-i")
+        {
+            if (!positional.empty()) throw std::invalid_argument("Use -i and -o for all paths when specifying command-line tasks");
+            if (named) appendTask();
+            named = true;
+            task.input = value;
+        }
+        else if (arg == "-o")
+        {
+            if (!named || !task.output.empty() || value.empty())
+                throw std::invalid_argument("Specify one -o OUTPUT after each -i INPUT");
+            task.output = value;
         }
         else if (arg == "--raw")
-            options.raw = value;
+            task.raw = value;
         else if (arg == "--decoded")
-            options.decoded = value;
+            task.decoded = value;
         else if (arg == "--trace")
-            options.trace = value;
+            task.trace = value;
         else
-            options.profile = value;
+            task.profile = value;
     }
     if (options.help || options.version) return options;
-    if (options.driverInfo)
+    if (!options.driverInfo)
     {
-        options.config = loadConfig(configFile);
-        return options;
+        if (named)
+            appendTask();
+        else if (taskOption || !positional.empty())
+        {
+            if (positional.size() != 2) throw std::invalid_argument("Provide exactly one input and one output path");
+            task.input = std::move(positional[0]);
+            task.output = std::move(positional[1]);
+            appendTask();
+        }
     }
-    if (!selected) throw std::invalid_argument("Choose --live or --anime");
-    if (paths.size() != 2) throw std::invalid_argument("Provide exactly one input and one output path");
-    if (options.scale != 1 && options.scale != 2 && options.scale != 4) throw std::invalid_argument("Scale must be 1, 2 or 4");
-    if (options.tile > 0 && options.tile % 16) throw std::invalid_argument("Tile must be a multiple of 16");
-    if (options.halo > 0 && options.halo % 16) throw std::invalid_argument("Halo must be a multiple of 16");
-    // Prevent overflowing crop coordinates even for malformed command lines.
-    if (options.tile > maxTileDimension || options.halo > maxTileDimension) throw std::invalid_argument("Tile or halo is too large");
-    options.config = loadConfig(configFile);
-    const auto& tiling = options.config.tiling(options.model);
-    if (options.tile == -1) options.tile = tiling.tile;
-    if (options.halo == -1) options.halo = tiling.halo;
-    if (!options.trace.empty() && options.tile > 0) throw std::invalid_argument("--trace requires --tile 0");
-    if (!options.profile.empty() && !options.trace.empty())
-        throw std::invalid_argument("--profile cannot be combined with --trace");
-    options.input = paths[0];
-    options.output = paths[1];
+    options.config = loadConfig(configFile, options.tasks);
+    if (options.driverInfo) return options;
+    if (options.tasks.empty()) throw std::invalid_argument("Provide a command-line task or add [[tasks]] to the config");
+    for (auto& queued : options.tasks)
+        applyDefaults(queued, options.config);
     return options;
 }
 } // namespace upscaler

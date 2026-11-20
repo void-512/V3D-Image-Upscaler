@@ -19,3 +19,10 @@ tile_size = 576
 halo = 96
 # Upper bound on the rows processed together by the 4x upsampling tail.
 max_strip_rows = 256
+
+# Uncomment to enqueue a task. Paths are relative to this config file.
+# [[tasks]]
+# input = "images/example.png"
+# type = "anime"
+# scale = 4
+# output = "images/example-4x.png"
