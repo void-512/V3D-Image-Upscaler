@@ -29,6 +29,17 @@ std::vector<int> cuts(int length, int tile)
     result.push_back(length);
     return result;
 }
+int largestTileExtent(const std::vector<int>& edges, int halo)
+{
+    int largest = 0;
+    for (size_t i = 1; i < edges.size(); ++i)
+    {
+        const int start = std::max(edges[i - 1] - halo, 0);
+        const int end = std::min(edges[i] + halo, edges.back());
+        largest = std::max(largest, end - start);
+    }
+    return largest;
+}
 struct Band
 {
     const OutputRows& output;
@@ -80,6 +91,7 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
     const int halo = options.halo;
     const int blend = options.model == Model::Live && halo >= 352 ? 0 : halo / 2;
     const auto xs = cuts(width, options.tile), ys = cuts(height, options.tile);
+    network.allocate(largestTileExtent(ys, halo), largestTileExtent(xs, halo), scale);
     std::optional<Band> band;
     if (output)
         band.emplace(output, width * scale, std::min(height, options.tile + 2 * blend) * scale);
