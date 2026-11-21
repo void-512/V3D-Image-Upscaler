@@ -28,7 +28,9 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ```
 
-`build/product/` contains `upscaler` and `libvulkan_broadcom.so`. Keep them together. The executable embeds the models and shaders.
+The default build compiles both targets. Use `cmake --build build --target upscaler` to build only the executable or `cmake --build build --target driver` to build only the Mesa driver.
+
+`build/product/` contains `upscaler` and `libvulkan_broadcom.so`. Keep them together.
 
 ## Configuration
 

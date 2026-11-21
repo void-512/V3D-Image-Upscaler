@@ -34,7 +34,7 @@ add_custom_command(OUTPUT "${private_driver}"
     COMMAND "${CMAKE_STRIP}" --strip-unneeded "${private_driver}"
     DEPENDS "${mesa_builder}" "${mesa_patch}" "${UPSCALER_MESA_SOURCE}/VERSION"
     COMMENT "Building the private Broadcom Vulkan driver" USES_TERMINAL VERBATIM)
-set_source_files_properties("${private_driver}" PROPERTIES HEADER_FILE_ONLY TRUE)
+add_custom_target(driver ALL DEPENDS "${private_driver}")
 
 set(generated "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${generated}")
@@ -123,7 +123,7 @@ add_executable(upscaler
     src/main.cpp src/runtime.cpp src/config.cpp src/options.cpp src/upscale.cpp
     src/output_file.cpp src/png_writer.cpp src/network.cpp src/gpu.cpp
     src/downscale.cpp src/image_io.cpp src/networks/dat.cpp src/networks/rrdb.cpp
-    "${generated}/resources.cpp" "${generated}/resources.S" "${private_driver}")
+    "${generated}/resources.cpp" "${generated}/resources.S")
 target_include_directories(upscaler PRIVATE src)
 target_include_directories(upscaler SYSTEM PRIVATE "${UPSCALER_STB_INCLUDE}" "${TOML_INCLUDE}")
 target_compile_definitions(upscaler PRIVATE UPSCALER_VERSION="${PROJECT_VERSION}")
