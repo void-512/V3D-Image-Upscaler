@@ -58,15 +58,6 @@ bool confirmPaths(const std::vector<Task>& tasks)
     return answer == "y" || answer == "Y";
 }
 
-int resolveTile(const Task& task, const Config& config, int width, int height)
-{
-    if (task.tile != -1) return task.tile;
-    const bool largeAttention = task.model == Model::Anime && uint64_t((height + 15) / 16 * 16) * ((width + 15) / 16 * 16) * 384 * 4 > uint64_t(1) * 1024 * 1024 * 1024;
-    const auto memoryLimit = uint64_t(config.tileMemoryThresholdMiB) * 1024 * 1024;
-    const bool tile = estimatedMemory(task.model, height, width, task.scale, config) > memoryLimit || largeAttention;
-    return tile ? config.tiling(task.model).tileSize : 0;
-}
-
 void runBenchmark(const Options& options)
 {
     using Clock = std::chrono::steady_clock;

@@ -1,5 +1,5 @@
 [performance]
-# Switch to tiling when the estimated full-frame working set exceeds this size.
+# Limit the estimated tile working set and switch to tiling when the full frame exceeds this size.
 tile_memory_threoshold_mib = 2048
 # Local size for Winograd transforms, DAT copy and depthwise, and RRDB packing.
 linear_workgroup_size = 192

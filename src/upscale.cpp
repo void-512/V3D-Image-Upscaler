@@ -20,25 +20,23 @@ void upload(Network& dat, Model model, const unsigned char* pixels, int width, i
 }
 
 namespace {
-std::vector<int> cuts(int length, int tile)
+int tileStep(int length, int tile)
 {
     const int count = (length + tile - 1) / tile;
-    const int step = ((length + count - 1) / count + 15) / 16 * 16;
+    return ((length + count - 1) / count + 15) / 16 * 16;
+}
+std::vector<int> cuts(int length, int step)
+{
     std::vector<int> result;
     for (int x = 0; x < length; x += step) result.push_back(x);
     result.push_back(length);
     return result;
 }
-int largestTileExtent(const std::vector<int>& edges, int halo)
+int largestTileExtent(int length, int step, int halo)
 {
-    int largest = 0;
-    for (size_t i = 1; i < edges.size(); ++i)
-    {
-        const int start = std::max(edges[i - 1] - halo, 0);
-        const int end = std::min(edges[i] + halo, edges.back());
-        largest = std::max(largest, end - start);
-    }
-    return largest;
+    // The core containing the midpoint loses the least halo to the image edges.
+    const int start = length / (2 * step) * step;
+    return std::min(start + step + halo, length) - std::max(start - halo, 0);
 }
 struct Band
 {
@@ -76,6 +74,38 @@ struct Band
 };
 }
 
+int resolveTile(const Task& task, const Config& config, int width, int height)
+{
+    int tile = task.tile;
+    if (tile == 0) return tile;
+
+    const auto memoryLimit = uint64_t(config.tileMemoryThresholdMiB) * 1024 * 1024;
+    if (tile == -1)
+    {
+        const bool largeAttention = task.model == Model::Anime &&
+            uint64_t((height + 15) / 16 * 16) * ((width + 15) / 16 * 16) * 384 * 4 > uint64_t(1) * 1024 * 1024 * 1024;
+        if (!largeAttention && estimatedMemory(task.model, height, width, task.scale, config) <= memoryLimit)
+            return 0;
+        tile = config.tiling(task.model).tileSize;
+    }
+
+    const auto fits = [&](int core) {
+        const int h = largestTileExtent(height, tileStep(height, core), task.halo);
+        const int w = largestTileExtent(width, tileStep(width, core), task.halo);
+        return estimatedMemory(task.model, h, w, task.scale, config) <= memoryLimit;
+    };
+    if (fits(tile)) return tile;
+
+    const auto error = "Tile core size " + std::to_string(tile) + " exceeds the configured RAM limit of "
+        + std::to_string(config.tileMemoryThresholdMiB) + " MiB. ";
+    // Rebalancing the cuts can shrink the largest tile when the core size increases.
+    for (int core = maxTileDimension; core >= 16; core -= 16)
+        if (fits(core))
+            throw std::runtime_error(error + "Maximum allowed tile core size is " + std::to_string(core)
+                                     + " pixels (--tile " + std::to_string(core) + ").");
+    throw std::runtime_error(error + "No positive tile size fits with the current settings.");
+}
+
 void upscale(Network& network, const unsigned char* pixels, int width, int height, const Task& options,
              const OutputRows& output)
 {
@@ -90,8 +120,9 @@ void upscale(Network& network, const unsigned char* pixels, int width, int heigh
 
     const int halo = options.halo;
     const int blend = options.model == Model::Live && halo >= 352 ? 0 : halo / 2;
-    const auto xs = cuts(width, options.tile), ys = cuts(height, options.tile);
-    network.allocate(largestTileExtent(ys, halo), largestTileExtent(xs, halo), scale);
+    const int xStep = tileStep(width, options.tile), yStep = tileStep(height, options.tile);
+    const auto xs = cuts(width, xStep), ys = cuts(height, yStep);
+    network.allocate(largestTileExtent(height, yStep, halo), largestTileExtent(width, xStep, halo), scale);
     std::optional<Band> band;
     if (output)
         band.emplace(output, width * scale, std::min(height, options.tile + 2 * blend) * scale);
