@@ -1,11 +1,11 @@
 [performance]
-# Limit the estimated tile working set and switch to tiling when the full frame exceeds this size.
+# Maximum vram usage.
 tile_memory_threoshold_mib = 2048
-# Local size for Winograd transforms, DAT copy and depthwise, and RRDB packing.
 linear_workgroup_size = 192
 
 [anime]
-# -1 chooses automatically. 0 forces full-frame inference.
+# -1 automatic choose full-frame inference when spare memory is allowed, tile otherwise.
+# 0 forces full-frame inference.
 tile = -1
 tile_size = 448
 halo = 48

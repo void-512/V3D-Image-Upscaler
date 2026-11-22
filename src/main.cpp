@@ -87,8 +87,9 @@ void runBenchmark(const Options& options)
         task.scale = scale;
         task.tile = config.tiling(model).tile;
         task.halo = config.tiling(model).halo;
-        task.tile = resolveTile(task, config, width, height);
         Gpu gpu(model, config);
+        task.tile = resolveTile(task, config, width, height,
+                                gpu.properties.limits.maxStorageBufferRange, gpu.bufferHeapSize());
         auto network = model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
         if (!task.tile)
         {
@@ -128,14 +129,15 @@ void runTask(Task task, const Config& config)
     if (!pixels) throw std::runtime_error(std::string("Cannot decode input: ") + stbi_failure_reason());
     if (!validImageDimensions(width, height))
         throw std::runtime_error("Image dimensions too large");
-    task.tile = resolveTile(task, config, width, height);
+    Gpu gpu(task.model, config);
+    task.tile = resolveTile(task, config, width, height,
+                            gpu.properties.limits.maxStorageBufferRange, gpu.bufferHeapSize());
     if (task.tile)
         std::cerr << "Tiling: core=" << task.tile << ", halo=" << task.halo
                   << ". Cropped-context output can differ from full-frame inference.\n";
 
     PngWriter writer(task.output, width * task.scale, height * task.scale);
     {
-        Gpu gpu(task.model, config);
         auto network = task.model == Model::Anime ? makeAnimeNetwork(gpu) : makeLiveNetwork(gpu);
         if (!task.tile)
         {

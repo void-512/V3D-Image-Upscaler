@@ -53,6 +53,7 @@ public:
     ~Gpu();
 
     BufferPtr buffer(size_t floats);
+    VkDeviceSize bufferHeapSize() const;
 
     VkPipeline pipeline(const std::string& name, const Params& p);
 
@@ -65,6 +66,8 @@ public:
 
     void finish();
 
+private:
+    uint32_t bufferMemoryType(uint32_t memoryTypeBits) const;
 };
 
 } // namespace upscaler

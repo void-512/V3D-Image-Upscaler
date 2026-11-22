@@ -261,9 +261,9 @@ public:
     }
 };
 
-uint64_t animeBufferBytes(int h, int w, int scale, const Config& config)
+MemoryEstimate estimateAnimeBuffers(int h, int w, int scale, const Config& config)
 {
-    return bufferBytes(DatNetwork::bufferSizes(h, w, scale, config));
+    return estimateBuffers(DatNetwork::bufferSizes(h, w, scale, config));
 }
 
 std::unique_ptr<Network> makeAnimeNetwork(Gpu& gpu)

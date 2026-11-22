@@ -157,9 +157,9 @@ public:
     }
 };
 
-uint64_t liveBufferBytes(int h, int w, int scale, const Config& config)
+MemoryEstimate estimateLiveBuffers(int h, int w, int scale, const Config& config)
 {
-    return bufferBytes(RRDBNet::bufferSizes(h, w, scale, liveStripRows(h, w, config)));
+    return estimateBuffers(RRDBNet::bufferSizes(h, w, scale, liveStripRows(h, w, config)));
 }
 
 std::unique_ptr<Network> makeLiveNetwork(Gpu& gpu)

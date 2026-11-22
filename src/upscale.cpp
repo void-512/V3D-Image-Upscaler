@@ -74,25 +74,24 @@ struct Band
 };
 }
 
-int resolveTile(const Task& task, const Config& config, int width, int height)
+int resolveTile(const Task& task, const Config& config, int width, int height,
+                uint64_t storageBufferLimit, uint64_t heapLimit)
 {
     int tile = task.tile;
     if (tile == 0) return tile;
 
-    const auto memoryLimit = uint64_t(config.tileMemoryThresholdMiB) * 1024 * 1024;
     if (tile == -1)
     {
-        const bool largeAttention = task.model == Model::Anime &&
-            uint64_t((height + 15) / 16 * 16) * ((width + 15) / 16 * 16) * 384 * 4 > uint64_t(1) * 1024 * 1024 * 1024;
-        if (!largeAttention && estimatedMemory(task.model, height, width, task.scale, config) <= memoryLimit)
-            return 0;
+        const auto full = estimateMemory(task.model, height, width, task.scale, config);
+        if (full.largestBufferBytes <= storageBufferLimit && full.totalBytes <= heapLimit) return 0;
         tile = config.tiling(task.model).tileSize;
     }
 
+    const auto memoryLimit = uint64_t(config.tileMemoryThresholdMiB) * 1024 * 1024;
     const auto fits = [&](int core) {
         const int h = largestTileExtent(height, tileStep(height, core), task.halo);
         const int w = largestTileExtent(width, tileStep(width, core), task.halo);
-        return estimatedMemory(task.model, h, w, task.scale, config) <= memoryLimit;
+        return estimateMemory(task.model, h, w, task.scale, config).totalBytes <= memoryLimit;
     };
     if (fits(tile)) return tile;
 

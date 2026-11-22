@@ -67,15 +67,16 @@ int Network::at(const std::string& name) const
     return tensors.at(name).first;
 }
 
-uint64_t estimatedMemory(Model model, int h, int w, int scale, const Config& config)
+MemoryEstimate estimateMemory(Model model, int h, int w, int scale, const Config& config)
 {
-    const auto buffers = model == Model::Anime ? animeBufferBytes(h, w, scale, config)
-                                              : liveBufferBytes(h, w, scale, config);
+    auto estimate = model == Model::Anime ? estimateAnimeBuffers(h, w, scale, config)
+                                         : estimateLiveBuffers(h, w, scale, config);
     // The model asset includes both weight buffers and a small tensor directory.
     const auto weights = modelResource(model).size;
     // Scales below 4x render a 4H by scale*W RGBA32 Lanczos intermediate.
     const uint64_t texels = scale == 4 ? 0 : uint64_t(h) * w * 4 * scale;
-    return buffers + weights + texels * 4 * sizeof(float);
+    estimate.totalBytes += weights + texels * 4 * sizeof(float);
+    return estimate;
 }
 
 } // namespace upscaler

@@ -137,6 +137,24 @@ Gpu::~Gpu()
     if (instance) vkDestroyInstance(instance, nullptr);
 }
 
+uint32_t Gpu::bufferMemoryType(uint32_t memoryTypeBits) const
+{
+    constexpr auto flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t type = 0; type < memories.memoryTypeCount; ++type)
+        if ((memoryTypeBits & (1u << type)) && (memories.memoryTypes[type].propertyFlags & flags) == flags)
+            return type;
+    throw std::runtime_error("V3D coherent unified memory is required");
+}
+
+VkDeviceSize Gpu::bufferHeapSize() const
+{
+    // The dummy buffer uses the same creation flags and usage as the inference buffers.
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device, dummy->buffer, &requirements);
+    const auto type = bufferMemoryType(requirements.memoryTypeBits);
+    return memories.memoryHeaps[memories.memoryTypes[type].heapIndex].size;
+}
+
 BufferPtr Gpu::buffer(size_t floats)
 {
     size_t bytes = std::max<size_t>(floats * 4, 16);
@@ -151,13 +169,9 @@ BufferPtr Gpu::buffer(size_t floats)
     check(vkCreateBuffer(device, &ci, nullptr, &b->buffer));
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(device, b->buffer, &mr);
-    uint32_t type = 0;
-    for (; type < memories.memoryTypeCount; type++)
-        if ((mr.memoryTypeBits & (1u << type)) && (memories.memoryTypes[type].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) break;
-    if (type == memories.memoryTypeCount) throw std::runtime_error("V3D coherent unified memory is required");
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = type;
+    ai.memoryTypeIndex = bufferMemoryType(mr.memoryTypeBits);
     check(vkAllocateMemory(device, &ai, nullptr, &b->memory));
     check(vkBindBufferMemory(device, b->buffer, b->memory, 0));
     check(vkMapMemory(device, b->memory, 0, bytes, 0, &b->mapped));
